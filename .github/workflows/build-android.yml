@@ -1,0 +1,76 @@
+name: Build UC Plus (Android)
+
+# Builds the signed release APKs with nothing to configure:
+#  - the three native engines are built from source here (or restored from cache),
+#  - the signing key is the committed android/keystore/uc-plus-release.jks,
+#  - if UC-Plus-source.zip is in the repository root it is unpacked first.
+
+on:
+  push:
+    paths:
+      - "UC-Plus-source.zip"
+      - "android/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Unpack UC-Plus-source.zip when it is present
+        run: |
+          if [ -f UC-Plus-source.zip ]; then
+            unzip -q -o UC-Plus-source.zip -d .
+            rm UC-Plus-source.zip
+            echo "Source archive unpacked."
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Go for the native engines
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.3"
+
+      - name: Set up Android NDK r28
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28b
+          add-to-path: false
+
+      - name: Restore built native engines
+        id: native-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            android/app/src/main/jniLibs/*/*.so
+          key: native-${{ hashFiles('android/tools/build_native_libs.sh', 'android/patches/**', 'android/app/singbox-core.json') }}
+
+      - name: Build the native engines
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash android/tools/build_native_libs.sh
+
+      - name: Build release APKs
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: uc-plus-apks
+          path: android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
