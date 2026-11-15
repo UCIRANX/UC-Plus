@@ -69,7 +69,7 @@
 
 | پروتکل | موتور | نوع لینک |
 |---|---|---|
-| VLESS | sing-box / Xray | `vless://' |
+| VLESS | sing-box / Xray | `vless://` |
 | Shadowsocks | sing-box | `ss://` |
 | Hysteria 2 | sing-box | `hy2://` |
 | OpenVPN | OpenVPN | `udp\|tcp:CC:base64` |
