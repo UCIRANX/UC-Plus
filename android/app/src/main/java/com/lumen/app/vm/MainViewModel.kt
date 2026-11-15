@@ -2776,8 +2776,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val pending = java.util.Collections.synchronizedSet(targetIds.toMutableSet())
                 val completedPings = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
                 val semaphore = kotlinx.coroutines.sync.Semaphore(limit)
-                // Only one temporary core runs at a time; the probes inside it are gated separately.
-                val batchSlot = kotlinx.coroutines.sync.Semaphore(1)
                 // Same protocol order as the server list; AUTO pools stay last.
                 val ordered = targets.sortedWith(
                     compareBy<NodeEntity>({ it.isAutoNode || it.protocol.equals("auto", true) },
@@ -2832,7 +2830,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         try {
                             if (unit.size > 1) {
                                 val reported = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-                                batchSlot.withPermit {
+                                semaphore.withPermit {
                                     batchProxyPing(unit) { id, ping ->
                                         reported.add(id)
                                         finishNode(id, ping)
@@ -3518,17 +3516,29 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val iran = geoRegionCode(settingsNow.geoResourceSource) == "ir"
             val outbounds = JSONArray()
             val probeTags = LinkedHashMap<String, String>()
+            // Address lookups run in parallel; a serial loop made every node wait for the previous lookup.
+            val pinnedByNode: Map<String, Map<String, List<String>>> = kotlinx.coroutines.coroutineScope {
+                group.map { entity ->
+                    async(Dispatchers.IO) {
+                        val host = runCatching { parseEntity(entity).server }.getOrNull()
+                        val pinnedMap: Map<String, List<String>> = if (host == null) emptyMap() else ProbeIo.run {
+                            runCatching {
+                                ServerAddressPinner.pinnedAddresses(
+                                    hostnames = listOf(host),
+                                    foreignResolver = settingsNow.dnsDirectServers.lineSequence()
+                                        .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
+                                    preferSystemDns = iran
+                                )
+                            }.getOrDefault(emptyMap())
+                        }
+                        entity.id to pinnedMap
+                    }
+                }.awaitAll().toMap()
+            }
             group.forEachIndexed { index, entity ->
                 val parsed = runCatching { parseEntity(entity) }.getOrNull() ?: return@forEachIndexed
                 if (obfsBridgeOf(parsed) != null) return@forEachIndexed
-                val pinned = ProbeIo.run { runCatching {
-                    ServerAddressPinner.pinnedAddresses(
-                        hostnames = listOf(parsed.server),
-                        foreignResolver = settingsNow.dnsDirectServers.lineSequence()
-                            .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
-                        preferSystemDns = iran
-                    )
-                }.getOrDefault(emptyMap()) }
+                val pinned = pinnedByNode[entity.id].orEmpty()
                 val json = runCatching {
                     JSONObject(HybridConfigBuilder.buildConfig(
                         parsed,
@@ -4763,7 +4773,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /** Ping methods that start a temporary core for the node instead of probing its endpoint. */
         private val CORE_PING_TYPES = setOf("http")
         /** Plain nodes probed per temporary core in HTTP mode (one core start instead of one per node). */
-        private const val PING_BATCH_SIZE = 256
+        private const val PING_BATCH_SIZE = 8
         private val NON_PROXY_OUTBOUND_TYPES = setOf("direct", "block", "dns", "selector", "urltest")
         /** Protocols whose endpoint only listens on UDP, so a TCP connect can never succeed. */
         private val UDP_ONLY_SCHEMES = setOf(
