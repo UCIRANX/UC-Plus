@@ -1,0 +1,44 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Lumen</string>
+    <string name="connect">اتصال</string>
+    <string name="disconnect">قطع اتصال</string>
+    <string name="connected">متصل</string>
+    <string name="connecting">در حال اتصال…</string>
+    <string name="disconnected">قطع شده</string>
+    <string name="error">خطا</string>
+    <string name="servers">سرورها</string>
+    <string name="subscriptions">اشتراک‌ها</string>
+    <string name="routing">مسیریابی</string>
+    <string name="settings">تنظیمات</string>
+    <string name="logs">گزارش‌ها</string>
+    <string name="add_subscription">افزودن اشتراک</string>
+    <string name="auto_select">انتخاب خودکار</string>
+    <string name="ping_all">پینگ</string>
+    <string name="speed_test">آزمایش سرعت</string>
+    <string name="protocol_vless">VLESS</string>
+    <string name="protocol_vmess">VMess</string>
+    <string name="protocol_trojan">Trojan</string>
+    <string name="protocol_ss">Shadowsocks</string>
+    <string name="protocol_hy2">Hysteria 2</string>
+    <string name="protocol_tuic">TUIC</string>
+    <string name="protocol_wg">WireGuard</string>
+    <string name="protocol_awg">AmneziaWG</string>
+    <string name="protocol_openvpn">OpenVPN</string>
+    <string name="engine_singbox">sing-box</string>
+    <string name="split_tunneling">مسیریابی تفکیک‌شده</string>
+    <string name="per_app_vpn">پراکسی برای هر برنامه</string>
+    <string name="node_editor_title">ویرایش سرور</string>
+    <string name="server_address">نشانی سرور</string>
+    <string name="server_port">پورت</string>
+    <string name="uuid_password">UUID / گذرواژه</string>
+    <string name="sni">SNI</string>
+    <string name="flow">جریان</string>
+    <string name="alpn">ALPN</string>
+    <string name="fingerprint">اثر انگشت</string>
+    <string name="public_key">کلید عمومی</string>
+    <string name="short_id">شناسه کوتاه</string>
+    <string name="awg_junk_params">پارامترهای داده پوششی AWG</string>
+    <string name="widget_description">اتصال سریع به سرور انتخاب‌شده</string>
+    <string name="widget_compact_description">دکمه فشرده روشن/خاموش ۱×۱</string>
+</resources>

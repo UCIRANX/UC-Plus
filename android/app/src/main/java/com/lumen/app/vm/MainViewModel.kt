@@ -1,0 +1,4981 @@
+package com.lumen.app.vm
+
+import android.app.Application
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.room.Room
+import androidx.room.withTransaction
+import com.lumen.app.LauncherIconManager
+import com.lumen.app.subscription.ImportClassification
+import com.lumen.app.subscription.ImportClassifier
+import com.lumen.app.subscription.ImportKind
+import com.lumen.app.subscription.SubscriptionClient
+import com.lumen.app.subscription.SubscriptionMetadata
+import com.lumen.app.update.AndroidUpdateChecker
+import com.lumen.app.update.AndroidUpdateInstaller
+import com.lumen.app.update.AndroidRelease
+import com.lumen.app.update.AndroidUpdateState
+import com.lumen.app.util.NodeDraftMapper
+import com.lumen.app.profiles.ProtectedProfiles
+import com.lumen.core.config.crypto.ProtectedProfileCodec
+import com.lumen.core.config.builder.HybridConfigBuilder
+import com.lumen.core.config.builder.CoreMode
+import com.lumen.core.config.builder.SingboxConfigBuilder
+import com.lumen.core.config.builder.SingboxConfigOptions
+import com.lumen.core.config.parser.LinkParser
+import com.lumen.core.config.parser.ParsedNode
+import org.json.JSONArray
+import org.json.JSONObject
+import com.lumen.core.database.AppDatabase
+import com.lumen.core.database.model.NodeEntity
+import com.lumen.core.database.model.NodeGroupMemberEntity
+import com.lumen.core.database.model.ServerGroupEntity
+import com.lumen.core.database.model.SubscriptionEntity
+import com.lumen.core.database.model.groupKey
+import com.lumen.core.vpn.LumenVpnService
+import com.lumen.core.vpn.ObfsRelay
+import com.lumen.core.vpn.VpnLogBus
+import com.lumen.core.vpn.VpnLogEntry
+import com.lumen.core.vpn.VpnLogLevel
+import com.lumen.core.vpn.VpnLogSettings
+import com.lumen.core.vpn.VpnStartIntentFactory
+import com.lumen.core.vpn.VpnStartParams
+import com.lumen.ui.components.ConnectionState
+import com.lumen.ui.components.CountryFlagHelper
+import com.lumen.ui.screens.AppEntryUiModel
+import com.lumen.ui.screens.DashboardStyle
+import com.lumen.ui.screens.GeoResourceUiModel
+import com.lumen.ui.screens.ImportKindUi
+import com.lumen.ui.screens.ImportPhaseUi
+import com.lumen.ui.screens.ImportUiState
+import com.lumen.ui.screens.LauncherIconOption
+import com.lumen.ui.screens.LogEntryUi
+import com.lumen.ui.screens.NodeDraft
+import com.lumen.ui.screens.NodeUiModel
+import com.lumen.ui.screens.ServerGroupUiModel
+import com.lumen.ui.screens.SettingsUiState
+import com.lumen.ui.screens.SplitModeUi
+import com.lumen.ui.screens.SubscriptionUiModel
+import com.lumen.ui.screens.ThemeMode
+import com.lumen.ui.screens.ThemePreset
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.URL
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import net.kramb.lumen.BuildConfig
+
+/**
+ * One-shot things that happened, for the UI to react to once. Collected by the
+ * navigator, which turns each into a haptic tick.
+ */
+enum class LumenEvent {
+    /** The tunnel came up. */
+    Connected,
+
+    /** The tunnel went away, whether the user asked for it or it dropped. */
+    Disconnected,
+
+    /** At least one server reached the database: manual save, import or subscription. */
+    ServerAdded
+}
+
+/**
+ * What one subscription refresh actually changed. Kept as numbers instead of a ready
+ * sentence so the UI can phrase it in the user's language.
+ */
+data class SubscriptionUpdateSummary(
+    val subscriptionName: String,
+    val added: Int,
+    val updated: Int,
+    val removed: Int,
+    val total: Int
+) {
+    val unchanged: Boolean get() = added == 0 && updated == 0 && removed == 0
+}
+
+/**
+ * Identity of a subscription server across refreshes. The row id is regenerated on
+ * every refresh, so the endpoint itself is what tells "added" from "updated".
+ */
+internal fun subscriptionNodeKey(
+    server: String,
+    port: Int,
+    protocol: String,
+    name: String = ""
+): String {
+    val normalizedProtocol = protocol.trim().lowercase(Locale.US)
+    // AUTO rows deliberately have no endpoint, so endpoint-only identity collapsed every
+    // country pool into "auto||0". The display name is the provider's stable selector
+    // identity and keeps Netherlands AUTO distinct from United States AUTO.
+    return if (normalizedProtocol == "auto" || (server.isBlank() && port == 0)) {
+        "$normalizedProtocol|selector|${name.trim().lowercase(Locale.US)}"
+    } else {
+        "$normalizedProtocol|${server.trim().lowercase(Locale.US)}|$port"
+    }
+}
+
+private val AUTO_REGION_GEO_TAGS = setOf(
+    "geosite:ru", "geosite:category-ru", "geoip:ru",
+    "geosite:cn", "geosite:category-cn", "geoip:cn",
+    "geosite:ir", "geosite:category-ir", "geoip:ir"
+)
+
+private fun withoutRoutingAction(value: String): String {
+    val trimmed = value.trim()
+    val prefix = listOf("proxy:", "block:", "reject:", "direct:")
+        .firstOrNull { trimmed.startsWith(it, true) }
+    return if (prefix == null) trimmed else trimmed.substring(prefix.length).trim()
+}
+
+internal fun geoRegionCode(source: String): String {
+    val normalized = source.lowercase(Locale.US)
+    return when {
+        "loyalsoldier" in normalized -> "cn"
+        "chocolate4u" in normalized -> "ir"
+        else -> "ru"
+    }
+}
+
+/** Only a completed persisted result can trigger destructive ping cleanup. */
+internal fun isPingRemovalCandidate(pingMs: Int?, thresholdMs: Int): Boolean =
+    pingMs != null && pingMs >= 0 && pingMs <= thresholdMs.coerceAtLeast(0)
+
+/**
+ * The selected region is the only regional pair in the new set. Regional rules left
+ * by the previous automatic preset are deliberately ignored before downloads begin.
+ */
+internal fun geoRuleSetsForRegion(
+    code: String,
+    directDomains: String,
+    directIpCidrs: String
+): List<Pair<String, String>> {
+    val wanted = LinkedHashSet<Pair<String, String>>()
+    wanted += "geosite" to if (code == "ru") "category-ru" else code
+    wanted += "geoip" to code
+    // Block Ads is a global preset, not a regional one. Keep its binary set in
+    // every managed download so enabling the preset never produces a visible
+    // rule that the strict local-only builder has to discard.
+    wanted += "geosite" to "category-ads-all"
+    (directDomains + "\n" + directIpCidrs)
+        .split(Regex("[\\n,;]+"))
+        .map(::withoutRoutingAction)
+        .filter(String::isNotEmpty)
+        .forEach { value ->
+            val lower = value.lowercase(Locale.US)
+            if (lower in AUTO_REGION_GEO_TAGS) return@forEach
+            when {
+                lower.startsWith("geosite:") ->
+                    wanted += "geosite" to lower.removePrefix("geosite:").trim()
+                lower.startsWith("geoip:") ->
+                    wanted += "geoip" to lower.removePrefix("geoip:").trim()
+            }
+        }
+    return wanted.filter { it.second.isNotEmpty() }
+}
+
+/** Replaces every automatic regional routing entry while preserving non-regional rules. */
+internal fun switchAutomaticGeoRegion(settings: SettingsUiState, code: String): SettingsUiState {
+    fun clean(raw: String): List<String> = raw
+        .split(Regex("[\\n,;]+"))
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .filterNot { withoutRoutingAction(it).lowercase(Locale.US) in AUTO_REGION_GEO_TAGS }
+
+    val siteTag = if (code == "ru") "geosite:category-ru" else "geosite:$code"
+    val orderedRules = clean(settings.directDomains) + clean(settings.directIpCidrs)
+    return settings.copy(
+        directDomains = (orderedRules + "direct:$siteTag" + "direct:geoip:$code")
+            .distinct()
+            .joinToString("\n"),
+        directIpCidrs = ""
+    )
+}
+
+internal fun selectedAppsFirst(
+    apps: List<AppEntryUiModel>,
+    selectedPackages: Set<String>
+): List<AppEntryUiModel> = apps
+    .map { it.copy(isSelected = it.packageName in selectedPackages) }
+    .sortedWith(
+        compareByDescending<AppEntryUiModel> { it.isSelected }
+            .thenBy { it.label.lowercase(Locale.ROOT) }
+            .thenBy { it.packageName }
+    )
+
+class MainViewModel(app: Application) : AndroidViewModel(app) {
+    private val sessionOpenVpnSecrets = java.util.concurrent.ConcurrentHashMap<String, com.lumen.core.config.parser.OpenVpnSecrets>()
+
+    private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // Welcome/onboarding screens are disabled: the app always opens on Servers.
+    private val _onboarding = MutableStateFlow(com.lumen.ui.screens.OnboardingUiState(
+        visible = false,
+        setupRequired = prefs.getInt("onboarding_revision", 0) < com.lumen.ui.screens.ONBOARDING_REVISION,
+        previousVersion = prefs.getString("onboarding_version", "").orEmpty()
+    ))
+    val onboarding: StateFlow<com.lumen.ui.screens.OnboardingUiState> = _onboarding
+    private var warpGenerationJob: Job? = null
+    private var onboardingPreparationJob: Job? = null
+
+    fun completeOnboarding() {
+        if (_onboarding.value.preparing || _onboarding.value.warpBusy) return
+        if (!_onboarding.value.setupRequired) { markOnboardingCompleted(); return }
+        _onboarding.update { it.copy(preparing = true, preparationError = false) }
+        val current = _settings.value
+        onboardingPreparationJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    installBundledGeoResources(current.geoResourceSource)
+                    com.lumen.app.onboarding.prepareOnboardingGeoResources(
+                        current, geoResourcesDir, BuildConfig.VERSION_NAME, ::replaceGeoResource)
+                }
+                refreshGeoResources()
+                markOnboardingCompleted()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                _onboarding.update { it.copy(preparationError = true) }
+            } finally {
+                _onboarding.update { it.copy(preparing = false) }
+            }
+        }
+    }
+
+    fun reopenOnboarding() {
+        _onboarding.update { it.copy(visible = true, setupRequired = true, previousVersion = "", preparationError = false) }
+    }
+
+    fun cancelOnboardingPreparation() { onboardingPreparationJob?.cancel() }
+
+    private fun markOnboardingCompleted() {
+        prefs.edit().putInt("onboarding_revision", com.lumen.ui.screens.ONBOARDING_REVISION)
+            .putString("onboarding_version", BuildConfig.VERSION_NAME)
+            .putInt("onboarding_version_code", BuildConfig.VERSION_CODE).apply()
+        _onboarding.update { it.copy(visible = false) }
+    }
+
+    fun cancelWarpGeneration() { warpGenerationJob?.cancel() }
+
+    fun generateWarpProfiles() {
+        if (_onboarding.value.warpBusy) return
+        _onboarding.update { it.copy(warpBusy = true, warpError = false, warpIncomplete = false) }
+        warpGenerationJob = viewModelScope.launch {
+            try {
+                val existingWarpNodes = withContext(Dispatchers.IO) {
+                    nodeDao.getNodes().first().filter(::isWarpNode)
+                }
+                val includeAwg = existingWarpNodes.none {
+                    it.protocol.equals("awg", true) || it.protocol.equals("wireguard", true) ||
+                        it.protocol.equals("amneziawg", true) || it.protocol.equals("wg", true)
+                }
+                val includeMasque = existingWarpNodes.none { it.protocol.equals("masque", true) }
+                if (!includeAwg && !includeMasque) {
+                    _onboarding.update { it.copy(warpCount = existingWarpNodes.size, warpIncomplete = false) }
+                    return@launch
+                }
+                val result = com.lumen.app.onboarding.WarpRegistrationClient(BuildConfig.VERSION_NAME)
+                    .generate(includeAwg = includeAwg, includeMasque = includeMasque)
+                val entities = result.nodes.map { it.toEntity(null) }
+                if (entities.isNotEmpty()) {
+                    withContext(Dispatchers.IO) {
+                        val group = serverGroupDao.getGroups().first().firstOrNull { it.name.equals("WARP", true) }
+                            ?: ServerGroupEntity(id = "lumen-warp", name = "WARP")
+                        db.withTransaction {
+                            serverGroupDao.insertGroup(group)
+                            nodeDao.insertNodes(entities)
+                            serverGroupDao.assignNodes(entities.map { it.groupKey() }, group.id)
+                        }
+                        selectServerFilter("group:${group.id}")
+                    }
+                }
+                val firstAvailable = entities.firstOrNull() ?: existingWarpNodes.firstOrNull()
+                if (_selectedNodeId.value == null && firstAvailable != null) {
+                    persistSelectedNodeIdentity(firstAvailable.id, firstAvailable.name)
+                    scheduleStoredVpnConfigRefresh()
+                }
+                _onboarding.update {
+                    val totalProfiles = existingWarpNodes.size + entities.size
+                    it.copy(
+                        warpCount = totalProfiles,
+                        warpIncomplete = result.incomplete && totalProfiles > 0,
+                        warpError = result.incomplete && totalProfiles == 0
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                _onboarding.update { it.copy(warpError = true) }
+            } finally {
+                _onboarding.update { it.copy(warpBusy = false) }
+            }
+        }
+    }
+
+    private val subscriptionRefreshEpoch = java.util.concurrent.atomic.AtomicLong()
+    private val subscriptionRefreshClaims = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val subscriptionMutations = Mutex()
+
+    private val _androidUpdateState = MutableStateFlow(restoredAndroidUpdateState())
+    internal val androidUpdateState: StateFlow<AndroidUpdateState> = _androidUpdateState
+
+    private fun restoredAndroidUpdateState(): AndroidUpdateState {
+        val tag = prefs.getString(PREF_LATEST_ANDROID_UPDATE_TAG, null)
+            ?.trim()
+            .orEmpty()
+        val version = prefs.getString(PREF_LATEST_ANDROID_UPDATE_VERSION, null)
+            ?.trim()
+            .orEmpty()
+        val apkUrl = prefs.getString(PREF_LATEST_ANDROID_UPDATE_APK_URL, null)
+            ?.trim()
+            .orEmpty()
+        if (tag.isBlank() || version.isBlank() || apkUrl.isBlank()) {
+            return AndroidUpdateState()
+        }
+        val release = AndroidRelease(
+            tag = tag,
+            version = version,
+            releaseUrl = prefs.getString(PREF_LATEST_ANDROID_UPDATE_RELEASE_URL, "")
+                .orEmpty(),
+            apkName = prefs.getString(PREF_LATEST_ANDROID_UPDATE_APK_NAME, null),
+            apkUrl = apkUrl
+        )
+        return AndroidUpdateState(
+            latest = release,
+            updateAvailable = AndroidUpdateChecker.isNewer(
+                release.version,
+                BuildConfig.VERSION_NAME
+            ),
+            checked = true
+        )
+    }
+
+    private fun rememberAndroidRelease(release: AndroidRelease) {
+        prefs.edit()
+            .putString(PREF_LATEST_ANDROID_UPDATE_TAG, release.tag)
+            .putString(PREF_LATEST_ANDROID_UPDATE_VERSION, release.version)
+            .putString(PREF_LATEST_ANDROID_UPDATE_RELEASE_URL, release.releaseUrl)
+            .putString(PREF_LATEST_ANDROID_UPDATE_APK_NAME, release.apkName)
+            .putString(PREF_LATEST_ANDROID_UPDATE_APK_URL, release.apkUrl)
+            .apply()
+    }
+
+    internal fun checkForAndroidUpdate(force: Boolean = false) {
+        if (!force) {
+            if (!_settings.value.autoCheckUpdates) return
+            val now = System.currentTimeMillis()
+            val last = prefs.getLong(PREF_LAST_ANDROID_UPDATE_CHECK, 0L)
+            if (!AndroidUpdateChecker.isAutoCheckDue(now, last)) return
+        }
+        checkForAndroidUpdateInternal(force = force, userInitiated = force)
+    }
+
+    /** Called when the activity returns to the foreground; the check itself is daily. */
+    internal fun checkForAndroidUpdateIfDue() {
+        checkForAndroidUpdate(force = false)
+    }
+
+    private fun checkForAndroidUpdateInternal(force: Boolean, userInitiated: Boolean) {
+        if (!AndroidUpdateChecker.ENABLED) return
+        val current = _androidUpdateState.value
+        if (current.isChecking || (!force && !_settings.value.autoCheckUpdates)) return
+        prefs.edit()
+            .putLong(PREF_LAST_ANDROID_UPDATE_CHECK, System.currentTimeMillis())
+            .apply()
+        _androidUpdateState.value = current.copy(isChecking = true, error = null)
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                AndroidUpdateChecker.fetch(Build.SUPPORTED_ABIS.toList())
+            }.onSuccess { release ->
+                rememberAndroidRelease(release)
+                _androidUpdateState.value = AndroidUpdateState(
+                    isChecking = false,
+                    latest = release,
+                    updateAvailable = AndroidUpdateChecker.isNewer(
+                        release.version,
+                        BuildConfig.VERSION_NAME
+                    ),
+                    checked = true
+                )
+            }.onFailure { error ->
+                _androidUpdateState.update { state ->
+                    state.copy(
+                        isChecking = false,
+                        error = if (userInitiated) {
+                            error.message ?: "Could not check GitHub releases"
+                        } else {
+                            null
+                        },
+                        checked = true
+                    )
+                }
+                VpnLogBus.warning("UPDATE", "Android update check failed: ${error.message}")
+            }
+        }
+    }
+
+    internal fun prepareAndroidUpdate() {
+        val current = _androidUpdateState.value
+        val release = current.latest
+        if (current.isDownloading || !current.updateAvailable || release?.apkUrl.isNullOrBlank()) {
+            return
+        }
+        _androidUpdateState.update {
+            it.copy(isDownloading = true, downloadProgress = null, error = null)
+        }
+        val application = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val apk = AndroidUpdateInstaller.downloadAndValidate(
+                    context = application,
+                    release = release,
+                    onProgress = { progress ->
+                        _androidUpdateState.update { state ->
+                            if (state.latest?.tag == release.tag && state.isDownloading) {
+                                state.copy(downloadProgress = progress)
+                            } else {
+                                state
+                            }
+                        }
+                    }
+                )
+                _androidUpdateState.update { state ->
+                    if (state.latest?.tag == release.tag) {
+                        state.copy(
+                            isDownloading = false,
+                            downloadProgress = 100,
+                            downloadedApkPath = apk.absolutePath,
+                            installRequestId = state.installRequestId + 1L,
+                            error = null
+                        )
+                    } else {
+                        state
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                _androidUpdateState.update {
+                    it.copy(
+                        isDownloading = false,
+                        downloadProgress = null,
+                        downloadedApkPath = null,
+                        error = error.message ?: "Could not prepare the Android update"
+                    )
+                }
+                VpnLogBus.warning(
+                    "UPDATE",
+                    "Android update download failed: ${error.message ?: error::class.java.simpleName}"
+                )
+            }
+        }
+    }
+
+    internal fun reportAndroidUpdateError(message: String) {
+        _androidUpdateState.update {
+            it.copy(
+                isDownloading = false,
+                downloadProgress = null,
+                downloadedApkPath = null,
+                error = message
+            )
+        }
+        VpnLogBus.warning("UPDATE", message)
+    }
+
+    /**
+     * Clears a one-shot installer request before the PackageInstaller session is
+     * created. This prevents a rotation or activity recreation from committing the
+     * same APK twice while Android's confirmation UI is already open.
+     */
+    internal fun consumeAndroidUpdateInstallRequest(requestId: Long) {
+        _androidUpdateState.update { state ->
+            if (state.installRequestId == requestId) {
+                state.copy(downloadedApkPath = null)
+            } else {
+                state
+            }
+        }
+    }
+
+    // No destructive fallback: `nodes` holds hand-typed servers and keys that
+    // cannot be recovered, so a missing migration must fail loudly instead.
+    private val db = Room.databaseBuilder(app, AppDatabase::class.java, "lumen.db")
+        .addMigrations(
+            AppDatabase.MIGRATION_1_2,
+            AppDatabase.MIGRATION_2_3,
+            AppDatabase.MIGRATION_3_4,
+            AppDatabase.MIGRATION_4_5
+        )
+        .build()
+    private val nodeDao = db.nodeDao()
+    private val subscriptionDao = db.subscriptionDao()
+    private val serverGroupDao = db.serverGroupDao()
+    private var storedVpnConfigRefreshJob: Job? = null
+    private val storedVpnConfigWriteMutex = Mutex()
+    private val subscriptionHwid: String by lazy {
+        prefs.getString("subscription_hwid", null)?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString().also {
+            prefs.edit().putString("subscription_hwid", it).apply()
+        }
+    }
+
+    init {
+        // The service inits the log bus for itself, but a widget or tile start is the
+        // only path that creates it: without this the app process persists nothing
+        // until the first connection.
+        VpnLogBus.init(app)
+        // Single source of truth for the version shown in the UI and sent in headers.
+        com.lumen.ui.screens.LumenVersion.appVersion = net.kramb.lumen.BuildConfig.VERSION_NAME
+        com.lumen.core.vpn.TelemetryManager.appVersion = net.kramb.lumen.BuildConfig.VERSION_NAME
+        // Keep Android visible in the same 45-minute "online now" window as desktop.
+        com.lumen.core.vpn.TelemetryManager.startHeartbeatLoop(app, viewModelScope)
+        com.lumen.core.vpn.TelemetryManager.startErrorUploadLoop(app, viewModelScope)
+        reconcileLauncherIcon()
+    }
+
+    /**
+     * Component-enabled state persists across updates but a fresh install starts from
+     * the manifest defaults, so a user who picked the dark icon would silently get the
+     * auto-theming one back after reinstalling. Re-applying the stored preference on
+     * every launch closes that gap; it is a no-op whenever the two already agree.
+     *
+     * The preference is read straight from [prefs] because this runs before
+     * [_settings] is constructed.
+     */
+    private fun reconcileLauncherIcon() {
+        val stored = runCatching {
+            LauncherIconOption.valueOf(
+                prefs.getString(PREF_LAUNCHER_ICON, LauncherIconOption.SYSTEM.name)
+                    ?: LauncherIconOption.SYSTEM.name
+            )
+        }.getOrDefault(LauncherIconOption.SYSTEM)
+        viewModelScope.launch(Dispatchers.IO) {
+            // Binder calls only; failures are non-fatal and leave the current icon alone.
+            runCatching { LauncherIconManager.applyOption(getApplication<Application>(), stored) }
+        }
+    }
+
+    // ---------- Logs ----------
+    // Log text is only formatted while the logs tab is open; elsewhere the flow stays empty.
+    private val _logsVisible = MutableStateFlow(false)
+
+    fun setLogsVisible(visible: Boolean) { _logsVisible.value = visible }
+
+    val logs: StateFlow<List<String>> = combine(VpnLogBus.entries, _logsVisible) { entries, visible ->
+        if (!visible) emptyList() else entries.map { entry ->
+            "[${entry.formattedTime}] [${entry.level.name}] [${entry.component}] ${entry.message}"
+        }
+    }.flowOn(Dispatchers.Default)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // History pulled from the persisted log, oldest first. Empty until the user asks
+    // for it: the live tail already covers the current session.
+    private val _olderLogEntries = MutableStateFlow<List<VpnLogEntry>>(emptyList())
+
+    /** Goes false once the persisted log has nothing older left, so the viewer can
+     *  stop offering a button that would do nothing. */
+    private val _moreLogHistory = MutableStateFlow(true)
+    val moreLogHistory: StateFlow<Boolean> = _moreLogHistory
+
+    /** The structured log the viewer renders: the loaded history followed by the live tail. */
+    val logEntries: StateFlow<List<LogEntryUi>> =
+        combine(VpnLogBus.entries, _olderLogEntries, _logsVisible) { live, older, visible ->
+            if (!visible) emptyList() else (older + live).map { entry ->
+                LogEntryUi(
+                    timestamp = entry.timestamp,
+                    time = entry.formattedTime,
+                    level = entry.level.name.lowercase(Locale.US),
+                    component = entry.component,
+                    message = entry.message
+                )
+            }
+        }.flowOn(Dispatchers.Default)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /**
+     * Pulls one more page of persisted history in front of what is already shown. The
+     * live tail is the newest slice of the same file, so skipping past both is what
+     * keeps the pages contiguous.
+     */
+    private var logHistoryJob: Job? = null
+    private var logHistoryGeneration = 0
+    private val _loadingLogHistory = MutableStateFlow(false)
+    val loadingLogHistory: StateFlow<Boolean> = _loadingLogHistory
+
+    fun loadOlderLogs() {
+        if (!_moreLogHistory.value || _loadingLogHistory.value) return
+        val generation = logHistoryGeneration
+        _loadingLogHistory.value = true
+        logHistoryJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val skip = VpnLogBus.entries.value.size + _olderLogEntries.value.size
+                val page = VpnLogBus.readPersisted(VpnLogBus.DEFAULT_PAGE_SIZE, skip)
+                if (generation == logHistoryGeneration) {
+                    _moreLogHistory.value = page.size >= VpnLogBus.DEFAULT_PAGE_SIZE
+                    if (page.isNotEmpty()) _olderLogEntries.update { page + it }
+                }
+            } finally {
+                if (generation == logHistoryGeneration) _loadingLogHistory.value = false
+            }
+        }
+    }
+
+    fun log(message: String) = VpnLogBus.info("APP", message)
+
+    fun clearLogs() {
+        logHistoryGeneration += 1
+        logHistoryJob?.cancel()
+        _loadingLogHistory.value = false
+        _olderLogEntries.value = emptyList()
+        _moreLogHistory.value = true
+        VpnLogBus.clear()
+    }
+
+    /** Shares the persisted log, not just the lines the viewer happens to hold. */
+    fun exportLogs(context: Context) {
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.IO) { VpnLogBus.exportText() }
+            shareLogText(context, text)
+        }
+    }
+
+    /** Shares exactly what the viewer's filter selected. */
+    fun exportLogText(context: Context, text: String) = shareLogText(context, text)
+
+    private fun shareLogText(context: Context, text: String) {
+        if (text.isBlank()) return
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Lumen logs")
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        context.startActivity(
+            Intent.createChooser(intent, "Export logs").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    // ---------- Settings ----------
+    private val _settings = MutableStateFlow(loadSettings())
+    val settings: StateFlow<SettingsUiState> = _settings
+
+    private fun normalizedPingType(raw: String?): String = when (raw?.trim()?.lowercase()) {
+        "tcp", "tcping" -> "tcping"
+        "icmp" -> "icmp"
+        "url", "real" -> "http"
+        // Measure the request/response round trip through the node after setup.
+        "http", "httpget", "http-get", "get" -> "http"
+        // UDP "ping" was never reliable for arbitrary VPN ports and is not a
+        // desktop Lumen mode. Migrate old installations to TCPing.
+        else -> "tcping"
+    }
+
+    // The core only knows sing-box level names. "warn" — written by older builds and
+    // still the shipped default — is not one of them, so the builder silently fell
+    // back to "info", the noisiest and most battery hungry setting the app has.
+    private fun normalizedLogLevel(raw: String?): String = when (raw?.trim()?.lowercase(Locale.US)) {
+        "trace" -> "trace"
+        "debug" -> "debug"
+        "info" -> "info"
+        "error" -> "error"
+        "fatal" -> "fatal"
+        "panic" -> "panic"
+        // The core refuses to start on "none" ("parse log level: unknown log level:
+        // none"), so an installation that stored "off" gets the quietest level it
+        // does accept instead of a config it rejects.
+        "off", "none" -> "error"
+        else -> "warning"
+    }
+
+    private fun loadSettings() = SettingsUiState(
+        engine = prefs.getString("core_mode", "HYBRID") ?: "HYBRID",
+        muxEnabled = prefs.getBoolean("mux_enabled", false),
+        muxConcurrency = prefs.getInt("mux_concurrency", 8),
+        multiplexProtocol = prefs.getString("mux_protocol", "smux") ?: "smux",
+        multiplexMinStreams = prefs.getInt("mux_min_streams", 4),
+        multiplexPadding = prefs.getBoolean("mux_padding", true),
+        multiplexBrutalEnabled = prefs.getBoolean("mux_brutal_enabled", false),
+        multiplexBrutalUpMbps = prefs.getInt("mux_brutal_up_mbps", 0),
+        multiplexBrutalDownMbps = prefs.getInt("mux_brutal_down_mbps", 0),
+        outboundTcpFastOpen = prefs.getBoolean("outbound_tcp_fast_open", false),
+        outboundTcpMultiPath = prefs.getBoolean("outbound_tcp_multi_path", false),
+        outboundUdpFragment = prefs.getBoolean("outbound_udp_fragment", false),
+        udpOverTcp = prefs.getBoolean("udp_over_tcp", false),
+        outboundConnectTimeoutSeconds = prefs.getInt("outbound_connect_timeout_s", 0),
+        fragmentEnabled = prefs.getBoolean("fragment_enabled", false),
+        fragmentPackets = prefs.getString("fragment_packets", "tlshello") ?: "tlshello",
+        fragmentLength = prefs.getString("fragment_length", "50-100") ?: "50-100",
+        fragmentDelay = prefs.getString("fragment_delay", "10-20") ?: "10-20",
+        localInboundEnabled = prefs.getBoolean("local_inbound", true) ||
+            prefs.getBoolean("proxy_only", false),
+        localSocksPort = prefs.getInt("local_socks_port", 10808),
+        localHttpPort = prefs.getInt("local_http_port", 10809),
+        lanSharingEnabled = prefs.getBoolean("lan_sharing", false),
+        socks5AuthEnabled = prefs.getBoolean("socks5_auth_enabled", true),
+        socks5Username = ensureSocks5Username(),
+        socks5Password = ensureSocks5Password(),
+        proxyOnly = prefs.getBoolean("proxy_only", false),
+        autoConnectOnBoot = prefs.getBoolean("boot_auto_connect", false),
+        enableSpeedStats = prefs.getBoolean("enable_speed_stats", true),
+        showNotification = prefs.getBoolean("show_notification", true),
+        showNotificationSpeed = prefs.getBoolean("show_notification_speed", true),
+        preferIpv6 = prefs.getBoolean("prefer_ipv6", false),
+        blockQuic = prefs.getBoolean("block_quic", false),
+        sniffRouteOnly = prefs.getBoolean("sniff_route_only", false),
+        mtu = prefs.getInt("mtu", 1500),
+        routingFinalOutbound = prefs.getString("routing_final_outbound", "proxy")?.takeIf { it == "direct" } ?: "proxy",
+        directDomains = prefs.getString("routing_direct_domains", null)?.takeIf { it.isNotBlank() } ?: com.lumen.ui.screens.DEFAULT_DIRECT_DOMAINS,
+        directIpCidrs = prefs.getString("routing_direct_ip_cidrs", "") ?: "",
+        geoResourceSource = prefs.getString(
+            "geo_resource_source",
+            "https://github.com/runetfreedom/russia-v2ray-rules-dat/"
+        ) ?: "https://github.com/runetfreedom/russia-v2ray-rules-dat/",
+        proxyDnsServer = prefs.getString("proxy_dns", "cloudflare-dns.com") ?: "cloudflare-dns.com",
+        directDnsServer = prefs.getString("direct_dns", "1.1.1.1") ?: "1.1.1.1",
+        dnsMode = prefs.getString("dns_mode", "automatic") ?: "automatic",
+        dnsCustomJson = prefs.getString("dns_custom_json", "")?.take(65_536) ?: "",
+        dnsDirectServers = prefs.getString("dns_direct_servers", null)
+            ?: (prefs.getString("direct_dns", "1.1.1.1") + "\n8.8.8.8"),
+        dnsProxyServers = prefs.getString("dns_proxy_servers", null)
+            ?: (prefs.getString("proxy_dns", "cloudflare-dns.com") + "\ndns.google"),
+        dnsDirectType = prefs.getString("dns_direct_type", "udp") ?: "udp",
+        dnsProxyType = prefs.getString("dns_proxy_type", "https") ?: "https",
+        dnsDirectStrategy = prefs.getString("dns_direct_strategy", "ipv4_only") ?: "ipv4_only",
+        dnsProxyStrategy = prefs.getString("dns_proxy_strategy", "ipv4_only") ?: "ipv4_only",
+        dnsHijackEnabled = prefs.getBoolean("dns_hijack_enabled", true),
+        dnsFakeIpEnabled = prefs.getBoolean("dns_fake_ip_enabled", true),
+        dnsParallelQuery = prefs.getBoolean("dns_parallel_query", false),
+        dnsOptimisticCache = prefs.getBoolean("dns_optimistic_cache", false),
+        dnsGeoCheck = prefs.getBoolean("dns_geo_check", true),
+        dnsProxyIpv4Only = prefs.getBoolean("dns_proxy_ipv4_only", true),
+        dnsHosts = prefs.getString("dns_hosts", "") ?: "",
+        // Older builds silently enabled a product-specific ntc.party hosts entry for
+        // every user. It is not a DNS default and can redirect traffic, so migrate
+        // that exact legacy pair to off; explicit custom entries remain available.
+        dnsOverrideEnabled = prefs.getBoolean("dns_override_enabled", false) &&
+            !(prefs.getString("dns_override_hostname", "").equals("ntc.party", true) &&
+                prefs.getString("dns_override_ipv4", "") == "130.255.77.28"),
+        dnsOverrideHostname = prefs.getString("dns_override_hostname", "") ?: "",
+        dnsOverrideIpv4 = prefs.getString("dns_override_ipv4", "") ?: "",
+        urlTestUrl = prefs.getString("url_test_url", "https://www.gstatic.com/generate_204")
+            ?: "https://www.gstatic.com/generate_204",
+        urlTestIntervalMinutes = prefs.getInt("url_test_interval_minutes", 3),
+        urlTestToleranceMs = prefs.getInt("url_test_tolerance_ms", 50),
+        urlTestIdleTimeoutMinutes = prefs.getInt("url_test_idle_timeout_minutes", 0),
+        urlTestInterruptExistConnections = prefs.getBoolean("url_test_interrupt_exist", true),
+        subscriptionUserAgent = prefs.getString("subscription_user_agent", "Happ/2.18.3/Windows/2606241603601")
+            ?: "Happ/2.18.3/Windows/2606241603601",
+        subscriptionHwid = prefs.getString("subscription_hwid", subscriptionHwid) ?: subscriptionHwid,
+        subscriptionSendHwid = prefs.getBoolean("subscription_send_hwid", true),
+        subscriptionDirect = prefs.getBoolean("subscription_direct", true),
+        allowSubscriptionOverrides = prefs.getBoolean("allow_subscription_overrides", true),
+        subscriptionAutoUpdateMinutes = normalizedSubscriptionAutoUpdateMinutes(
+            prefs.getInt("subscription_auto_update_minutes", 240)
+        ),
+        subscriptionIncludeRegex = prefs.getString("subscription_include_regex", "") ?: "",
+        subscriptionExcludeRegex = prefs.getString("subscription_exclude_regex", "") ?: "",
+        subscriptionUseProxyTun = prefs.getBoolean("subscription_use_proxy_tun", false),
+        subscriptionAllowHttp = prefs.getBoolean("subscription_allow_http", false),
+        subscriptionConverterEnabled = prefs.getBoolean("subscription_converter_enabled", false),
+        subscriptionConverterUrl = prefs.getString("subscription_converter_url", "") ?: "",
+        language = prefs.getString("language", Locale.getDefault().language)?.takeIf { it in setOf("en", "ru", "fa", "zh") } ?: "en",
+        themeMode = runCatching {
+            ThemeMode.valueOf(prefs.getString("theme_mode", ThemeMode.SYSTEM.name) ?: ThemeMode.SYSTEM.name)
+        }.getOrDefault(ThemeMode.SYSTEM),
+        themePreset = runCatching {
+            ThemePreset.valueOf(prefs.getString("theme_preset", ThemePreset.DARK.name) ?: ThemePreset.DARK.name)
+        }.getOrDefault(ThemePreset.DARK),
+        accentColor = prefs.getString("accent_color", "").orEmpty(),
+        useMaterialYou = prefs.getBoolean("use_material_you", false),
+        useAmoledBlack = prefs.getBoolean("use_amoled_black", false),
+        compactServerGrid = prefs.getBoolean("compact_server_grid", false),
+        hapticsEnabled = prefs.getBoolean("haptics_enabled", false),
+        telemetryEnabled = prefs.getBoolean(
+            com.lumen.core.vpn.TelemetryManager.PREF_TELEMETRY_ENABLED,
+            false
+        ),
+        reconnectOnNetworkChange = prefs.getBoolean("reconnect_on_network_change", true),
+        validateProxyDataPath = prefs.getBoolean("validate_proxy_data_path", false),
+        pingType = normalizedPingType(prefs.getString("server_speed_test_type", "http")),
+        pingTimeoutMs = prefs.getInt("ping_timeout_ms", 2000),
+        pingConcurrency = prefs.getInt("ping_concurrency", 64),
+        pingUrl = prefs.getString("ping_url", "https://www.gstatic.com/generate_204")
+            ?: "https://www.gstatic.com/generate_204",
+        pingAttempts = prefs.getInt("ping_attempts", 1),
+        pingAggregate = prefs.getString("ping_aggregate", "min")?.lowercase()
+            ?.takeIf { it in setOf("min", "avg", "median") } ?: "min",
+        pingRetryDelayMs = prefs.getInt("ping_retry_delay_ms", 200),
+        pingGoodMs = prefs.getInt("ping_good_ms", 150),
+        pingFairMs = prefs.getInt("ping_fair_ms", 300),
+        pingAutoOnOpen = prefs.getBoolean("ping_auto_on_open", false),
+        pingAutoDeleteUnreachable = prefs.getBoolean("ping_auto_delete_unreachable", false),
+        pingAutoDeleteThresholdMs = prefs.getInt("ping_auto_delete_threshold_ms", 1)
+            .coerceIn(0, 100),
+        autoCheckUpdates = prefs.getBoolean("auto_check_updates", true),
+        settingsTileLayout = prefs.getString("settings_tile_layout", "") ?: "",
+        dockScalePercent = com.lumen.ui.components.DockSize.fromPercent(prefs.getInt("dock_scale_percent", 100)).percent,
+        dashboardStyle = runCatching {
+            DashboardStyle.valueOf(prefs.getString("dashboard_style", DashboardStyle.DEFAULT.name) ?: DashboardStyle.DEFAULT.name)
+        }.getOrDefault(DashboardStyle.DEFAULT),
+        launcherIcon = runCatching {
+            LauncherIconOption.valueOf(
+                prefs.getString(PREF_LAUNCHER_ICON, LauncherIconOption.SYSTEM.name)
+                    ?: LauncherIconOption.SYSTEM.name
+            )
+        }.getOrDefault(LauncherIconOption.SYSTEM),
+        // One master switch owns the whole pipeline; the store keeps it under its
+        // own "app_log_enabled" key, so read it back from there.
+        loggingEnabled = appLogSettings.enabled
+    ).let(::migrateRegionalNetworkDefaults)
+
+    private fun migrateRegionalNetworkDefaults(stored: SettingsUiState): SettingsUiState {
+        if (geoRegionCode(stored.geoResourceSource) != "ir" ||
+            prefs.getBoolean("iran_network_defaults_v2", false)) return stored
+        val migrated = com.lumen.ui.screens.migrateIranNetworkDefaults(stored)
+        // Persist once so later user changes, including disabling parallel DNS,
+        // are respected on every subsequent launch.
+        prefs.edit()
+            .putBoolean("iran_network_defaults_v2", true)
+            .putString("dns_direct_servers", migrated.dnsDirectServers)
+            .putString("dns_direct_type", migrated.dnsDirectType)
+            .putString("dns_proxy_servers", migrated.dnsProxyServers)
+            .putString("dns_proxy_type", migrated.dnsProxyType)
+            .putBoolean("dns_parallel_query", migrated.dnsParallelQuery)
+            .putInt("ping_timeout_ms", migrated.pingTimeoutMs)
+            .putInt("ping_attempts", migrated.pingAttempts)
+            .putInt("ping_concurrency", migrated.pingConcurrency)
+            .putString("ping_url", migrated.pingUrl)
+            .putString("url_test_url", migrated.urlTestUrl)
+            .apply()
+        return migrated
+    }
+
+    /** Current application-log settings, straight from the store's own preferences. */
+    private val appLogSettings: VpnLogSettings
+        get() = VpnLogBus.loadSettings(getApplication<Application>())
+
+
+    private fun subscriptionRequestSettings(s: SettingsUiState): List<Any> = listOf(
+        normalizedSubscriptionAutoUpdateMinutes(s.subscriptionAutoUpdateMinutes),
+        s.subscriptionUserAgent, s.subscriptionHwid, s.subscriptionSendHwid,
+        s.subscriptionDirect, s.subscriptionAllowHttp, s.subscriptionUseProxyTun,
+        s.subscriptionIncludeRegex, s.subscriptionExcludeRegex,
+        s.localSocksPort, s.socks5AuthEnabled, s.socks5Username, s.socks5Password
+    )
+
+    fun updateSettings(requested: SettingsUiState) {
+        val s = if (geoRegionCode(requested.geoResourceSource) == "ir" &&
+            geoRegionCode(_settings.value.geoResourceSource) != "ir"
+        ) com.lumen.ui.screens.onboardingNetworkDefaults(requested, com.lumen.ui.screens.SetupRegion.IRAN)
+        else requested
+        if (!com.lumen.ui.screens.isValidSocks5Credential(s.socks5Username) ||
+            !com.lumen.ui.screens.isValidSocks5Credential(s.socks5Password)) {
+            log("SOCKS5 credentials were not saved: invalid byte length or control characters")
+            return
+        }
+        if (subscriptionRequestSettings(_settings.value) != subscriptionRequestSettings(s)) {
+            subscriptionRefreshEpoch.incrementAndGet()
+        }
+        val telemetryChanged = _settings.value.telemetryEnabled != s.telemetryEnabled
+        val launcherIconChanged = _settings.value.launcherIcon != s.launcherIcon
+        val autoUpdatesEnabled = !_settings.value.autoCheckUpdates && s.autoCheckUpdates
+        _settings.value = s.copy(
+            subscriptionAutoUpdateMinutes = normalizedSubscriptionAutoUpdateMinutes(s.subscriptionAutoUpdateMinutes)
+        )
+        prefs.edit()
+            .putBoolean("iran_network_defaults_v1", prefs.getBoolean("iran_network_defaults_v2", false) ||
+                geoRegionCode(s.geoResourceSource) == "ir")
+            // Setup already applied the defaults. Do not migrate over DNS edits
+            // made afterwards on the next application launch.
+            .putBoolean("iran_network_defaults_v2", prefs.getBoolean("iran_network_defaults_v2", false) ||
+                geoRegionCode(s.geoResourceSource) == "ir")
+            .putString("core_mode", s.engine)
+            .putBoolean("mux_enabled", s.muxEnabled)
+            .putInt("mux_concurrency", s.muxConcurrency.coerceIn(1, 1024))
+            .putString("mux_protocol", s.multiplexProtocol)
+            .putInt("mux_min_streams", s.multiplexMinStreams.coerceIn(0, 1024))
+            .putBoolean("mux_padding", s.multiplexPadding)
+            .putBoolean("mux_brutal_enabled", s.multiplexBrutalEnabled)
+            .putInt("mux_brutal_up_mbps", s.multiplexBrutalUpMbps.coerceIn(0, 10000))
+            .putInt("mux_brutal_down_mbps", s.multiplexBrutalDownMbps.coerceIn(0, 10000))
+            .putBoolean("outbound_tcp_fast_open", s.outboundTcpFastOpen)
+            .putBoolean("outbound_tcp_multi_path", s.outboundTcpMultiPath)
+            .putBoolean("outbound_udp_fragment", s.outboundUdpFragment)
+            .putBoolean("udp_over_tcp", s.udpOverTcp)
+            .putInt("outbound_connect_timeout_s", s.outboundConnectTimeoutSeconds.coerceIn(0, 600))
+            .putBoolean("fragment_enabled", s.fragmentEnabled)
+            .putString("fragment_packets", s.fragmentPackets)
+            .putString("fragment_length", s.fragmentLength)
+            .putString("fragment_delay", s.fragmentDelay)
+            .putBoolean("local_inbound", s.localInboundEnabled)
+            .putInt("local_socks_port", s.localSocksPort.coerceIn(1024, 65535))
+            .putInt("local_http_port", s.localHttpPort.coerceIn(1024, 65535))
+            .putBoolean("lan_sharing", s.lanSharingEnabled)
+            .putBoolean("socks5_auth_enabled", s.socks5AuthEnabled)
+            .putString("socks5_username", s.socks5Username)
+            .putString("socks5_password", s.socks5Password)
+            .putBoolean("proxy_only", s.proxyOnly)
+            .putBoolean("boot_auto_connect", s.autoConnectOnBoot)
+            .putBoolean("enable_speed_stats", s.enableSpeedStats)
+            .putBoolean("show_notification", s.showNotification)
+            .putBoolean("show_notification_speed", s.showNotificationSpeed)
+            .putBoolean("prefer_ipv6", s.preferIpv6)
+            .putBoolean("block_quic", s.blockQuic)
+            .putBoolean("sniff_route_only", s.sniffRouteOnly)
+            .putInt("mtu", s.mtu.coerceIn(1280, 9000))
+            .putString("routing_final_outbound", s.routingFinalOutbound)
+            .putString("routing_direct_domains", s.directDomains)
+            .putString("routing_direct_ip_cidrs", s.directIpCidrs)
+            .putString("geo_resource_source", s.geoResourceSource)
+            .putString("proxy_dns", s.dnsProxyServers.lineSequence().firstOrNull()?.trim().orEmpty().take(253))
+            .putString("direct_dns", s.dnsDirectServers.lineSequence().firstOrNull()?.trim().orEmpty().take(253))
+            .putString("dns_mode", s.dnsMode)
+            .putString("dns_custom_json", s.dnsCustomJson.take(65_536))
+            .putString("dns_direct_servers", s.dnsDirectServers.take(2048))
+            .putString("dns_proxy_servers", s.dnsProxyServers.take(2048))
+            .putString("dns_direct_type", s.dnsDirectType)
+            .putString("dns_proxy_type", s.dnsProxyType)
+            .putString("dns_direct_strategy", s.dnsDirectStrategy)
+            .putString("dns_proxy_strategy", s.dnsProxyStrategy)
+            .putBoolean("dns_hijack_enabled", s.dnsHijackEnabled)
+            .putBoolean("dns_fake_ip_enabled", s.dnsFakeIpEnabled)
+            .putBoolean("dns_parallel_query", s.dnsParallelQuery)
+            .putBoolean("dns_optimistic_cache", s.dnsOptimisticCache)
+            .putBoolean("dns_geo_check", s.dnsGeoCheck)
+            .putBoolean("dns_proxy_ipv4_only", s.dnsProxyIpv4Only)
+            .putString("dns_hosts", s.dnsHosts.take(4096))
+            .putBoolean("dns_override_enabled", s.dnsOverrideEnabled)
+            .putString("dns_override_hostname", s.dnsOverrideHostname.trim().take(253))
+            .putString("dns_override_ipv4", s.dnsOverrideIpv4.trim().take(15))
+            .putString("url_test_url", s.urlTestUrl.trim().take(512))
+            .putInt("url_test_interval_minutes", s.urlTestIntervalMinutes.coerceIn(1, 1440))
+            .putInt("url_test_tolerance_ms", s.urlTestToleranceMs.coerceIn(0, 5000))
+            .putInt("url_test_idle_timeout_minutes", s.urlTestIdleTimeoutMinutes.coerceIn(0, 1440))
+            .putBoolean("url_test_interrupt_exist", s.urlTestInterruptExistConnections)
+            .putString("subscription_user_agent", s.subscriptionUserAgent.trim().take(256))
+            .putString("subscription_hwid", s.subscriptionHwid.trim().take(256))
+            .putBoolean("subscription_send_hwid", s.subscriptionSendHwid)
+            .putBoolean("subscription_direct", s.subscriptionDirect)
+            .putBoolean("allow_subscription_overrides", s.allowSubscriptionOverrides)
+            .putInt("subscription_auto_update_minutes", normalizedSubscriptionAutoUpdateMinutes(s.subscriptionAutoUpdateMinutes))
+            .putString("subscription_include_regex", s.subscriptionIncludeRegex.trim().take(512))
+            .putString("subscription_exclude_regex", s.subscriptionExcludeRegex.trim().take(512))
+            .putBoolean("subscription_use_proxy_tun", s.subscriptionUseProxyTun)
+            .putBoolean("subscription_allow_http", s.subscriptionAllowHttp)
+            .putBoolean("subscription_converter_enabled", s.subscriptionConverterEnabled)
+            .putString("subscription_converter_url", s.subscriptionConverterUrl.trim().take(512))
+            .putString("engine_log_level", "debug")
+            .putString("language", s.language)
+            .putString("theme_mode", s.themeMode.name)
+            .putString("theme_preset", s.themePreset.name)
+            .putString("accent_color", s.accentColor)
+            .putBoolean("use_material_you", s.useMaterialYou)
+            .putBoolean("use_amoled_black", s.useAmoledBlack)
+            .putBoolean("compact_server_grid", s.compactServerGrid)
+            .putBoolean("haptics_enabled", s.hapticsEnabled)
+            .putBoolean(
+                com.lumen.core.vpn.TelemetryManager.PREF_TELEMETRY_ENABLED,
+                s.telemetryEnabled
+            )
+            .putBoolean("reconnect_on_network_change", s.reconnectOnNetworkChange)
+            .putBoolean("validate_proxy_data_path", s.validateProxyDataPath)
+            .putString("server_speed_test_type", s.pingType)
+            .putInt("ping_timeout_ms", s.pingTimeoutMs.coerceIn(500, 20000))
+            .putInt("ping_concurrency", s.pingConcurrency.coerceIn(1, 128))
+            .putString("ping_url", s.pingUrl.trim().take(512))
+            .putInt("ping_attempts", s.pingAttempts.coerceIn(1, 10))
+            .putString("ping_aggregate", s.pingAggregate)
+            .putInt("ping_retry_delay_ms", s.pingRetryDelayMs.coerceIn(0, 5000))
+            .putInt("ping_good_ms", s.pingGoodMs.coerceIn(10, 2000))
+            .putInt("ping_fair_ms", s.pingFairMs.coerceIn(20, 5000))
+            .putBoolean("ping_auto_on_open", s.pingAutoOnOpen)
+            .putBoolean("ping_auto_delete_unreachable", s.pingAutoDeleteUnreachable)
+            .putInt("ping_auto_delete_threshold_ms", s.pingAutoDeleteThresholdMs.coerceIn(0, 100))
+            .putBoolean("auto_check_updates", s.autoCheckUpdates)
+            .putString("dashboard_style", s.dashboardStyle.name)
+            .putInt("dock_scale_percent", com.lumen.ui.components.DockSize.fromPercent(s.dockScalePercent).percent)
+            .putString("settings_tile_layout", s.settingsTileLayout)
+            .putString(PREF_LAUNCHER_ICON, s.launcherIcon.name)
+            .apply()
+        // Persist first, then flip the components: if the process dies in between, the
+        // startup reconcile re-applies the stored choice instead of losing it.
+        if (launcherIconChanged) {
+            val wanted = s.launcherIcon
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { LauncherIconManager.applyOption(getApplication<Application>(), wanted) }
+            }
+        }
+        if (autoUpdatesEnabled) checkForAndroidUpdate(force = true)
+        // The log settings live in the bus under its own keys. Only the master switch
+        // is user facing now; verbosity and retention keep their stored defaults so
+        // turning logging back on restores the behaviour it had before.
+        VpnLogBus.updateSettings(
+            getApplication<Application>(),
+            VpnLogBus.settings.value.copy(
+                enabled = s.loggingEnabled,
+                persist = s.loggingEnabled
+            )
+        )
+        if (telemetryChanged) {
+            val application = getApplication<Application>()
+            com.lumen.core.vpn.TelemetryManager.setEnabled(application, s.telemetryEnabled)
+            if (s.telemetryEnabled) {
+                com.lumen.core.vpn.TelemetryManager.sendHeartbeatNow(application, viewModelScope)
+            }
+        }
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    // ---------- Socks5 authorization ----------
+    // The credentials live in preferences and are generated once, so the local
+    // proxy keeps the same login between restarts until the user resets it.
+    private fun ensureSocks5Username(): String {
+        val stored = prefs.getString("socks5_username", null).orEmpty()
+        if (com.lumen.ui.screens.isValidSocks5Credential(stored)) return stored
+        val generated = com.lumen.ui.screens.generateSocks5Username()
+        prefs.edit().putString("socks5_username", generated).apply()
+        return generated
+    }
+
+    private fun ensureSocks5Password(): String {
+        val stored = prefs.getString("socks5_password", null).orEmpty()
+        if (com.lumen.ui.screens.isValidSocks5Credential(stored)) return stored
+        val generated = com.lumen.ui.screens.generateSocks5Password()
+        prefs.edit().putString("socks5_password", generated).apply()
+        return generated
+    }
+
+    // ---------- Geo resources ----------
+    private val geoResourcesDir = File(app.filesDir, "georesources").apply { mkdirs() }
+    private val _geoResources = MutableStateFlow(
+        run {
+            runCatching { installBundledGeoResources() }
+            scanGeoResources()
+        }
+    )
+    val geoResources: StateFlow<List<GeoResourceUiModel>> = _geoResources
+    private val _isUpdatingGeoResources = MutableStateFlow(false)
+    val isUpdatingGeoResources: StateFlow<Boolean> = _isUpdatingGeoResources
+
+    // Only binary rule sets are listed: the core stopped reading the legacy .dat
+    // databases, so a leftover geosite.dat says nothing about what it will load.
+    private fun scanGeoResources(): List<GeoResourceUiModel> =
+        (geoResourcesDir.listFiles()?.asList() ?: emptyList())
+            .filter { it.isFile && it.name.endsWith(".srs", ignoreCase = true) }
+            .sortedBy { it.name.lowercase(Locale.US) }
+            .map { GeoResourceUiModel(it.name, it.length(), it.lastModified()) }
+
+    /**
+     * Russian and Iranian setup must work before a first connection gives access
+     * to GitHub. Restore only the active region, preserving downloaded updates.
+     */
+    private fun installBundledGeoResources(source: String = _settings.value.geoResourceSource) {
+        com.lumen.app.onboarding.restoreBundledGeoResources(
+            geoRegionCode(source), geoResourcesDir,
+            { path -> getApplication<Application>().assets.open(path) }, ::replaceGeoResource
+        )
+    }
+
+    fun refreshGeoResources() {
+        _geoResources.value = scanGeoResources()
+    }
+
+    fun downloadGeoResources(requestedSource: String) {
+        // Claim the flag before launching: reading it here and setting it inside the
+        // coroutine let two calls in the dispatch window share the same temp files.
+        if (!_isUpdatingGeoResources.compareAndSet(expect = false, update = true)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val staged = mutableListOf<Pair<String, File>>()
+            try {
+                val source = requestedSource.trim().ifBlank { _settings.value.geoResourceSource }
+                val code = geoRegionCode(source)
+                val settingsBeforeSwitch = _settings.value
+                val required = setOf(
+                    "geosite" to if (code == "ru") "category-ru" else code,
+                    "geoip" to code
+                )
+                // Downloading the sets here is what keeps a start offline-safe: a
+                // remote rule set is fetched while the core boots and a blocked
+                // raw.githubusercontent.com aborts the whole tunnel.
+                val targets = geoRuleSetsForRegion(
+                    code = code,
+                    directDomains = settingsBeforeSwitch.directDomains,
+                    directIpCidrs = settingsBeforeSwitch.directIpCidrs
+                ).map { ruleSet ->
+                    val (kind, geoCode) = ruleSet
+                    Triple(
+                        "$kind-$geoCode.srs",
+                        com.lumen.core.config.builder.SingboxConfigBuilder
+                            .ruleSetUrl(kind, geoCode, source),
+                        ruleSet in required
+                    )
+                }
+                targets.forEach { (name, link, isRequired) ->
+                    val temporary = File(geoResourcesDir, "$name.${UUID.randomUUID()}.download")
+                    runCatching {
+                        downloadGeoRuleSet(name, link, temporary)
+                        staged += name to temporary
+                    }.onFailure { failure ->
+                        temporary.delete()
+                        if (isRequired) throw failure
+                        // Optional custom categories may not be published by every source.
+                        // They are omitted from the new one-region set instead of retaining
+                        // an identically named file from the previous provider.
+                        log("Optional geo rule set skipped: $name: ${failure.message}")
+                    }
+                }
+
+                // Every required file exists in staging before the active set is touched.
+                staged.forEach { (name, temporary) ->
+                    val target = File(geoResourcesDir, name)
+                    replaceGeoResource(temporary, target)
+                    log("Geo rule set updated: $name (${target.length()} bytes)")
+                }
+                val keep = staged.map { it.first.lowercase(Locale.US) }.toSet()
+                geoResourcesDir.listFiles()?.forEach { file ->
+                    if (!file.isFile) return@forEach
+                    val lower = file.name.lowercase(Locale.US)
+                    val stale = lower.endsWith(".download") ||
+                        (lower.endsWith(".srs") && lower !in keep)
+                    if (stale && file.delete()) log("Geo rule set removed: ${file.name}")
+                }
+
+                // Source and automatic rules switch together, only after the complete
+                // mandatory set is installed. A failed download leaves the old region live.
+                withContext(Dispatchers.Main) {
+                    updateSettings(
+                        switchAutomaticGeoRegion(_settings.value, code).copy(
+                            geoResourceSource = source
+                        )
+                    )
+                    refreshGeoResources()
+                    log("Geo resources and routing switched to $code")
+                }
+            } catch (e: Exception) {
+                log("Geo resources update failed: ${e.message}")
+            } finally {
+                staged.forEach { (_, file) -> if (file.exists()) file.delete() }
+                _isUpdatingGeoResources.value = false
+            }
+        }
+    }
+
+    private fun downloadGeoRuleSet(name: String, link: String, temporary: File) {
+        val connection = URL(link).openConnection() as HttpURLConnection
+        connection.connectTimeout = 20_000
+        connection.readTimeout = 120_000
+        connection.instanceFollowRedirects = true
+        connection.setRequestProperty("User-Agent", "Lumen/${net.kramb.lumen.BuildConfig.VERSION_NAME}")
+        try {
+            if (connection.responseCode !in 200..299) {
+                error("$name: HTTP ${connection.responseCode}")
+            }
+            if (connection.contentLengthLong > GEO_RESOURCE_MAX_BYTES) {
+                error("$name: exceeded the 256 MB limit")
+            }
+            connection.inputStream.use { input ->
+                temporary.outputStream().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var copied = 0L
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        copied += count
+                        if (copied > GEO_RESOURCE_MAX_BYTES) {
+                            error("$name: exceeded the 256 MB limit")
+                        }
+                        output.write(buffer, 0, count)
+                    }
+                    if (copied < 64L) error("$name: file is too small")
+                }
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun replaceGeoResource(source: File, target: File) {
+        try {
+            Files.move(
+                source.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        } catch (_: AtomicMoveNotSupportedException) {
+            Files.move(
+                source.toPath(),
+                target.toPath(),
+                StandardCopyOption.REPLACE_EXISTING
+            )
+        }
+    }
+
+    // ---------- Split tunneling ----------
+    private val _splitMode = MutableStateFlow(
+        runCatching { SplitModeUi.valueOf(prefs.getString("split_mode", "DISABLED") ?: "DISABLED") }
+            .getOrDefault(SplitModeUi.DISABLED)
+    )
+    val splitMode: StateFlow<SplitModeUi> = _splitMode
+
+    private val _splitPackages = MutableStateFlow(
+        prefs.getStringSet("split_packages", emptySet())?.toSet() ?: emptySet()
+    )
+
+    private val _installedApps = MutableStateFlow<List<AppEntryUiModel>>(emptyList())
+    private val _isLoadingApps = MutableStateFlow(false)
+    val isLoadingApps: StateFlow<Boolean> = _isLoadingApps
+    // Pinned copy of v2rayNG's maintained proxy package list at commit
+    // 9896dd2974a9739090e5d48e421a7971cb484a08. Keeping it in the APK makes
+    // Auto-select immediate and deterministic even without Internet.
+    private val proxyAutoSelectPackages: Set<String> by lazy {
+        runCatching {
+            getApplication<Application>().assets.open("proxy_package_name")
+                .bufferedReader()
+                .useLines { lines ->
+                    lines.map(String::trim)
+                        .filter { it.isNotEmpty() && !it.startsWith("#") }
+                        .toSet()
+                }
+        }.getOrDefault(emptySet())
+    }
+
+    val apps: StateFlow<List<AppEntryUiModel>> =
+        combine(_installedApps, _splitPackages) { list, selected ->
+            selectedAppsFirst(list, selected)
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    fun setSplitMode(mode: SplitModeUi) {
+        _splitMode.value = mode
+        prefs.edit().putString("split_mode", mode.name).apply()
+        if (mode != SplitModeUi.DISABLED) loadInstalledApps()
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    fun toggleApp(app: AppEntryUiModel) {
+        val next = _splitPackages.value.toMutableSet()
+        if (!next.add(app.packageName)) next.remove(app.packageName)
+        _splitPackages.value = next
+        prefs.edit().putStringSet("split_packages", next).apply()
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    fun autoSelectApps() {
+        val selected = SplitAppAutoSelector.select(
+            mode = _splitMode.value,
+            apps = _installedApps.value,
+            proxyPackages = proxyAutoSelectPackages
+        )
+        _splitPackages.value = selected
+        prefs.edit().putStringSet("split_packages", selected).apply()
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    fun clearAppSelection() {
+        _splitPackages.value = emptySet()
+        prefs.edit().putStringSet("split_packages", emptySet()).apply()
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    fun loadInstalledApps() {
+        if (_isLoadingApps.value) return
+        _isLoadingApps.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val application = getApplication<Application>()
+                val pm = application.packageManager
+                val list = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                    .asSequence()
+                    .filter { it.packageName != application.packageName && it.enabled }
+                    .filter {
+                        pm.checkPermission(
+                            android.Manifest.permission.INTERNET,
+                            it.packageName
+                        ) == PackageManager.PERMISSION_GRANTED
+                    }
+                    .map {
+                        AppEntryUiModel(
+                            packageName = it.packageName,
+                            label = pm.getApplicationLabel(it).toString(),
+                            icon = runCatching {
+                                pm.getApplicationIcon(it).toBitmap(width = 48, height = 48).asImageBitmap()
+                            }.getOrNull(),
+                            isSystem = it.flags and ApplicationInfo.FLAG_SYSTEM != 0
+                        )
+                    }
+                    .sortedBy { it.label.lowercase(Locale.getDefault()) }
+                    .toList()
+                _installedApps.value = list
+                log("Found ${list.size} network-capable apps")
+                // Uninstalled packages left in the split list make the service fall
+                // back silently, so drop them once the real inventory is known.
+                val stale = _splitPackages.value.filterNot { packageName ->
+                    runCatching { pm.getApplicationInfo(packageName, 0) }.isSuccess
+                }
+                if (stale.isNotEmpty()) {
+                    val kept = _splitPackages.value - stale.toSet()
+                    _splitPackages.value = kept
+                    prefs.edit().putStringSet("split_packages", kept).apply()
+                    scheduleStoredVpnConfigRefresh()
+                    log("Removed ${stale.size} uninstalled app(s) from the split list")
+                }
+            } catch (e: Exception) {
+                log("Failed to list apps: ${e.message}")
+            } finally {
+                _isLoadingApps.value = false
+            }
+        }
+    }
+
+    // ---------- Nodes ----------
+    private val _selectedNodeId = MutableStateFlow(prefs.getString("selected_node_id", null))
+
+    private val nodeEntities: StateFlow<List<NodeEntity>> = nodeDao.getNodes()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val uiNodeEntities = nodeEntities.coalesceUiUpdates()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val countryCachePrefs =
+        app.getSharedPreferences("lumen_country_cache", Context.MODE_PRIVATE)
+    private val _resolvedCountryCodes = MutableStateFlow(
+        countryCachePrefs.all.mapNotNull { (host, value) ->
+            (value as? String)?.takeIf { it.length == 2 }?.let { host to it.uppercase(Locale.US) }
+        }.toMap()
+    )
+    private val countryLookupAttempted =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    init {
+        // Desktop Lumen resolves otherwise anonymous WireGuard endpoints through
+        // GeoIP. Android does the same asynchronously and caches the result; WARP
+        // is deliberately excluded because its endpoint location is not the
+        // virtual location represented by the profile.
+        viewModelScope.launch(Dispatchers.IO) {
+            var previousConfigFingerprint: List<NodeConfigFingerprint>? = null
+            uiNodeEntities.collectLatest { entities ->
+                val previous = previousConfigFingerprint
+                val changed = previous == null || previous.size != entities.size ||
+                    entities.indices.any { index -> !previous[index].matches(entities[index]) }
+                if (changed) {
+                    previousConfigFingerprint = entities.map { NodeConfigFingerprint.from(it) }
+                    scheduleStoredVpnConfigRefresh()
+                }
+                entities.forEach { entity ->
+                    if (!shouldResolveWireGuardCountry(entity)) return@forEach
+                    val host = normalizedEndpointHost(entity.server)
+                    if (host.isEmpty() || host in _resolvedCountryCodes.value) return@forEach
+                    if (!countryLookupAttempted.add(host)) return@forEach
+                    val code = resolveCountryCode(host)
+                    if (code.isNotEmpty()) {
+                        countryCachePrefs.edit().putString(host, code).apply()
+                        _resolvedCountryCodes.value = _resolvedCountryCodes.value + (host to code)
+                    }
+                }
+            }
+        }
+    }
+
+    // Cache of expensive per-node computations (flag stripping, country detection,
+    // display-protocol extraction). Keyed by node id + content fingerprint so ping
+    // updates or selection changes don't recompute regex/uppercase work per node.
+    private data class NodeUiCacheEntry(
+        val fingerprint: Int, val base: NodeUiModel, var presented: NodeUiModel? = null
+    )
+    private data class NodeConfigFingerprint(
+        val id: String,
+        val name: String,
+        val protocol: String,
+        val server: String,
+        val port: Int,
+        val link: String,
+        val outboundJson: String,
+        val subscriptionId: String?,
+        val isAutoNode: Boolean
+    ) {
+        fun matches(entity: NodeEntity): Boolean =
+            id == entity.id && name == entity.name && protocol == entity.protocol &&
+                server == entity.server && port == entity.port && link == entity.link &&
+                outboundJson == entity.outboundJson && subscriptionId == entity.subscriptionId &&
+                isAutoNode == entity.isAutoNode
+
+        companion object {
+            fun from(entity: NodeEntity) = NodeConfigFingerprint(
+                id = entity.id,
+                name = entity.name,
+                protocol = entity.protocol,
+                server = entity.server,
+                port = entity.port,
+                link = entity.link,
+                outboundJson = entity.outboundJson,
+                subscriptionId = entity.subscriptionId,
+                isAutoNode = entity.isAutoNode
+            )
+        }
+    }
+    private val nodeUiCache = java.util.concurrent.ConcurrentHashMap<String, NodeUiCacheEntry>()
+    private val nodeNameCountryCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // ---------- Custom server groups ----------
+    private val groupEntities: StateFlow<List<ServerGroupEntity>> = serverGroupDao.getGroups()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    private val groupMembers: StateFlow<List<NodeGroupMemberEntity>> = serverGroupDao.getMembers()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val nodes: StateFlow<List<NodeUiModel>> =
+        combine(
+            uiNodeEntities,
+            _resolvedCountryCodes,
+            groupEntities,
+            groupMembers
+        ) { list, resolvedCountryCodes, customGroups, members ->
+            val liveIds = HashSet<String>(list.size * 2)
+            // Membership is keyed on the node's stable key, not its row id, so it
+            // survives the delete/re-insert a subscription refresh does. Rows pointing
+            // at a group that no longer exists are ignored rather than hiding a server.
+            val liveGroupIds = customGroups.mapTo(HashSet()) { it.id }
+            val membership = members.asSequence()
+                .filter { it.groupId in liveGroupIds }
+                .associate { it.nodeKey to it.groupId }
+            val endpointCountryVotes = HashMap<String, MutableList<String>>()
+            list.forEach { entity ->
+                val explicitCountry = nodeNameCountryCache.computeIfAbsent(entity.name) {
+                    CountryFlagHelper.detectCountryFromName(it)
+                }
+                if (explicitCountry.isNotEmpty() && entity.server.isNotBlank() && entity.port > 0) {
+                    val endpointKey = normalizedEndpointKey(entity.server, entity.port)
+                    endpointCountryVotes.getOrPut(endpointKey) { ArrayList() }.add(explicitCountry)
+                }
+            }
+            val endpointCountryConsensus = endpointCountryVotes.mapValues { (_, codes) ->
+                CountryFlagHelper.consensusCountry(codes)
+            }.filterValues { it.isNotEmpty() }
+            val mapped = list.mapNotNull { e ->
+                runCatching {
+                    liveIds.add(e.id)
+                    val resolvedCountry = if (isWarpNode(e)) {
+                        ""
+                    } else {
+                        resolvedCountryCodes[normalizedEndpointHost(e.server)].orEmpty()
+                    }
+                    val endpointCountry = endpointCountryConsensus[normalizedEndpointKey(e.server, e.port)].orEmpty()
+                    val fingerprint = 31 * (31 * (31 * e.name.hashCode() + e.server.hashCode()) +
+                        e.protocol.hashCode()) +
+                        (e.outboundJson.hashCode() xor e.link.hashCode() xor
+                            resolvedCountry.hashCode() xor endpointCountry.hashCode()) + (if (e.favorite) 1 else 0)
+                    val cached = nodeUiCache[e.id]
+                    val base = if (cached != null && cached.fingerprint == fingerprint) {
+                        cached.base
+                    } else {
+                        val sourceName = e.name.ifBlank { e.server.ifBlank { "Server" } }
+                        val safeServer = e.server
+                        val countryCode = runCatching {
+                            endpointCountry
+                                .ifBlank { CountryFlagHelper.detectCountryStrict(sourceName, safeServer) }
+                                .ifBlank { resolvedCountry }
+                                .uppercase(Locale.US)
+                        }.getOrDefault(resolvedCountry)
+                        val strippedName = CountryFlagHelper
+                            .serverDisplayNameWithoutCountryPrefix(sourceName, countryCode)
+                            .let { com.lumen.ui.screens.cleanServerDisplayName(it) }
+                            .let(::stripFlagEmoji)
+                            .ifBlank { safeServer.ifBlank { "Server" } }
+                        // AWG/WireGuard links carry no human name, so the parser generates a
+                        // technical one ("AmneziaWG-1.2.3.4"). Show the location instead, the
+                        // same way VLESS subscription entries already do.
+                        val safeName =
+                            locationNameOrNull(strippedName, safeServer, countryCode) ?: strippedName
+                        val safeProtocol = e.protocol.ifBlank { "vless" }
+                        val autoFlag = e.isAutoNode || safeProtocol.equals("auto", true)
+                        val extractedProtocol =
+                            extractDisplayProtocol(safeProtocol, e.outboundJson, e.link)
+                        // WARP selector pools remain urltest nodes internally, but their
+                        // public protocol is MASQUE/WARP or AWG/WARP rather than AUTO.
+                        val displayProto = if (
+                            autoFlag &&
+                            !extractedProtocol.equals("WARP", true) &&
+                            !extractedProtocol.endsWith("/WARP", true)
+                        ) "AUTO" else extractedProtocol
+                        NodeUiModel(
+                            id = e.id,
+                            name = safeName,
+                            protocol = safeProtocol,
+                            server = safeServer,
+                            port = e.port,
+                            pingMs = null,
+                            countryCode = countryCode,
+                            isAutoNode = autoFlag,
+                            isSelected = false,
+                            subscriptionId = e.subscriptionId,
+                            isProtected = e.link.startsWith(ProtectedProfileCodec.PREFIX),
+                            displayProtocol = displayProto,
+                            isFavorite = e.favorite
+                        ).also { nodeUiCache[e.id] = NodeUiCacheEntry(fingerprint, it) }
+                    }
+                    val entry = nodeUiCache.getValue(e.id)
+                    val previous = entry.presented
+                    val groupId = membership[e.groupKey()]
+                    val selected = false
+                    val auto = e.isAutoNode || e.protocol.equals("auto", true)
+                    if (previous != null && previous.port == e.port && previous.pingMs == e.pingMs &&
+                        previous.isAutoNode == auto && previous.subscriptionId == e.subscriptionId &&
+                        previous.groupId == groupId && previous.isSelected == selected
+                    ) previous else base.copy(
+                        port = e.port,
+                        pingMs = e.pingMs,
+                        isAutoNode = auto,
+                        subscriptionId = e.subscriptionId,
+                        groupId = groupId,
+                        isSelected = selected
+                    ).also { entry.presented = it }
+                }.getOrNull()
+            }
+            nodeUiCache.keys.retainAll(liveIds)
+            nodeNameCountryCache.keys.retainAll(list.mapTo(HashSet()) { it.name })
+            // Ordering is a UI concern: the screens sort with the shared, persisted choice.
+            mapped
+        }.flowOn(Dispatchers.Default)
+            .combine(_selectedNodeId) { mapped, selectedId ->
+                // Selection must not re-run endpoint voting, parsing or group membership.
+                mapped.map { node -> if (node.id == selectedId) node.copy(isSelected = true) else node }
+            }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    val activeNode: StateFlow<NodeUiModel?> = nodes
+        .map { list -> list.firstOrNull { it.isSelected } ?: list.firstOrNull() }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    fun selectNode(node: NodeUiModel) {
+        if (_selectedNodeId.value != node.id) resetConnectedPing()
+        persistSelectedNodeIdentity(node.id, node.name)
+        scheduleStoredVpnConfigRefresh()
+        log("Selected ${node.name}")
+    }
+
+    private fun persistSelectedNodeIdentity(id: String, name: String) {
+        _selectedNodeId.value = id
+        // The name is mirrored into prefs so the home screen widget can label
+        // itself without opening the database.
+        // Base64 of the UTF-8 bytes avoids any charset mangling between the app
+        // process and the widget process.
+        val nameB64 = android.util.Base64.encodeToString(
+            name.toByteArray(Charsets.UTF_8),
+            android.util.Base64.NO_WRAP
+        )
+        prefs.edit()
+            .putString("selected_node_id", id)
+            .putString("selected_node_name", name)
+            .putString("selected_node_name_b64", nameB64)
+            .apply()
+        com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(getApplication())
+    }
+
+    fun toggleFavorite(node: NodeUiModel) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val current = nodeEntities.value.firstOrNull { it.id == node.id }?.favorite ?: node.isFavorite
+            nodeDao.setFavorite(node.id, !current)
+        }
+    }
+
+    fun deleteNode(node: NodeUiModel) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val entity = nodeEntities.value.firstOrNull { it.id == node.id }
+            // A favourite is kept until its heart is cleared.
+            if (entity?.favorite == true) return@launch
+            val key = entity?.groupKey()
+            nodeDao.deleteNodeById(node.id)
+            if (key != null) serverGroupDao.assignNodes(listOf(key), null)
+            log("Deleted node ${node.name}")
+        }
+    }
+
+    // Deletes servers belonging to the default / manual group only.
+    private var resetJob: Job? = null
+    fun resetLumen(target: com.lumen.ui.screens.LumenResetTarget) {
+        if (resetJob?.isActive == true) return
+        val strings = com.lumen.ui.screens.stringsForLanguage(_settings.value.language)
+        if (_importState.value.phase == ImportPhaseUi.IMPORTING) {
+            emitToast(com.lumen.ui.screens.InterfaceText.WAIT_IMPORT.inLanguage(_settings.value.language))
+            return
+        }
+        resetJob = viewModelScope.launch {
+            try {
+                val app = getApplication<Application>()
+                stopPing()
+                if (_connectionState.value == ConnectionState.Connected || _connectionState.value == ConnectionState.Connecting) {
+                    app.startService(buildStopIntent(app))
+                }
+                subscriptionRefreshEpoch.incrementAndGet()
+                if (target == com.lumen.ui.screens.LumenResetTarget.SETTINGS) {
+                    updateSettings(SettingsUiState(language = _settings.value.language,
+                        socks5Username = ensureSocks5Username(), socks5Password = ensureSocks5Password()))
+                    clearAppSelection()
+                    prefs.edit().remove("servers_last_sort").remove("servers_group_by_country")
+                        .remove("servers_filter_reachable").remove("servers_filter_max_ping")
+                        .remove("logs_level_filter").apply()
+                } else withContext(Dispatchers.IO) {
+                    subscriptionMutations.withLock {
+                        db.withTransaction {
+                            serverGroupDao.clearAllMembers()
+                            serverGroupDao.clearAllGroups()
+                            nodeDao.clearAllNodes()
+                            subscriptionDao.clearAllSubscriptions()
+                        }
+                        _subscriptionUsage.value = emptyMap()
+                        persistSubscriptionUsage(emptyMap())
+                        _subscriptionPremium.value = emptyMap()
+                        subscriptionFailures.clear()
+                        subscriptionRetryAfter.clear()
+                        _selectedNodeId.value = null
+                        prefs.edit().remove("selected_node_id").remove("selected_node_name")
+                            .remove("selected_node_name_b64").apply()
+                        selectServerFilter("all")
+                        _importState.value = ImportUiState()
+                        storedVpnConfigRefreshJob?.cancel()
+                        storedVpnConfigWriteMutex.withLock { com.lumen.core.vpn.VpnConfigStore.clear(app) }
+                        ProtectedProfiles.clearStoredProfiles(app)
+                    }
+                    com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(app)
+                }
+                emitToast(strings.resetComplete)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                log("Reset failed: ${error.javaClass.simpleName}")
+                emitToast(com.lumen.ui.screens.InterfaceText.RESET_FAILED.inLanguage(_settings.value.language))
+            }
+        }
+    }
+
+    fun deleteAllNodes() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val keys = nodeEntities.value.filter { it.subscriptionId == null }.map { it.groupKey() }
+            nodeDao.deleteManualNodes()
+            if (keys.isNotEmpty()) serverGroupDao.assignNodes(keys, null)
+            log("Deleted all manual nodes")
+        }
+    }
+
+    /**
+     * Groups the user made, with the number of servers currently assigned to each.
+     */
+    val serverGroups: StateFlow<List<ServerGroupUiModel>> =
+        combine(groupEntities, nodes) { groups, nodeList ->
+            groups.map { entity ->
+                ServerGroupUiModel(
+                    id = entity.id,
+                    name = entity.name,
+                    nodeCount = nodeList.count { it.groupId == entity.id }
+                )
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    fun createServerGroup(name: String) {
+        val clean = name.trim().take(64)
+        if (clean.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            serverGroupDao.insertGroup(ServerGroupEntity(name = clean))
+            log("Created server group $clean")
+        }
+    }
+
+    fun renameServerGroup(groupId: String, name: String) {
+        val clean = name.trim().take(64)
+        if (clean.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            serverGroupDao.renameGroup(groupId, clean)
+            log("Renamed server group to $clean")
+        }
+    }
+
+    /** Drops the group only: its servers stay and fall back to their default bucket. */
+    fun deleteServerGroup(groupId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val freed = serverGroupDao.membersOf(groupId).size
+            serverGroupDao.deleteGroup(groupId)
+            log("Deleted server group, $freed server(s) moved back to the default group")
+        }
+    }
+
+    /**
+     * Moves [targets] into [groupId]; null clears the assignment. Keyed on the node's
+     * stable key so a later subscription refresh keeps the grouping.
+     */
+    fun assignNodesToGroup(targets: List<NodeUiModel>, groupId: String?) {
+        if (targets.isEmpty()) return
+        val ids = targets.mapTo(HashSet()) { it.id }
+        viewModelScope.launch(Dispatchers.IO) {
+            val keys = nodeEntities.value.filter { it.id in ids }.map { it.groupKey() }.distinct()
+            if (keys.isEmpty()) return@launch
+            serverGroupDao.assignNodes(keys, groupId)
+            val destination = if (groupId == null) "no group" else "a group"
+            log("Moved ${keys.size} server(s) to $destination")
+        }
+    }
+
+    fun draftForNode(node: NodeUiModel): NodeDraft {
+        if (node.isProtected) return NodeDraft()
+        val draft = NodeDraftMapper.draftFromEntity(nodeEntities.value.firstOrNull { it.id == node.id }) ?: return NodeDraft()
+        val secret = sessionOpenVpnSecrets[node.id]?.takeIf { draft.protocol == "openvpn" } ?: return draft
+        return draft.copy(ovpnUsername = secret.username.ifEmpty { draft.ovpnUsername },
+            ovpnPassword = secret.password.ifEmpty { draft.ovpnPassword },
+            ovpnKeyPassword = secret.keyPassword.ifEmpty { draft.ovpnKeyPassword })
+    }
+
+    /**
+     * [onResult] receives null on success and the reason on failure, so the editor
+     * can stay open instead of pretending an unparsable draft was saved.
+     */
+    fun saveDraft(draft: NodeDraft, onResult: (String?) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val existing = draft.id?.let { id -> nodeEntities.value.firstOrNull { it.id == id } }
+                require(existing?.link?.startsWith(ProtectedProfileCodec.PREFIX) != true) { "Protected profiles cannot be edited" }
+                // The mapper leaves subscriptionId null, which is what a hand-made
+                // node needs: it belongs to the default (manual) group. An edited
+                // node must keep the group it came from instead, otherwise saving a
+                // subscription server silently detaches it from its subscription.
+                val entity = NodeDraftMapper.entityFromDraft(draft)
+                    .copy(subscriptionId = existing?.subscriptionId)
+                if (draft.id != null) nodeDao.updateNode(entity) else nodeDao.insertNode(entity)
+                sessionOpenVpnSecrets.remove(entity.id)
+                log("Saved node ${entity.name}")
+                // A new node is only visible in the default group, so open it there.
+                if (draft.id == null) {
+                    focusServerGroup(SERVER_GROUP_MANUAL)
+                    emitEvent(LumenEvent.ServerAdded)
+                }
+                withContext(Dispatchers.Main) { onResult(null) }
+            } catch (e: Exception) {
+                log("Failed to save node: ${e.message}")
+                withContext(Dispatchers.Main) { onResult(e.message ?: "Failed to save node") }
+            }
+        }
+    }
+
+    private val _importState = MutableStateFlow(ImportUiState())
+    val importState: StateFlow<ImportUiState> = _importState
+
+    // ---------- Where an import lands ----------
+    // ServerListScreen reads the group it opens on from KEY_SERVERS_LAST_GROUP, and so
+    // does the dashboard, so an import drives that one preference instead of growing a
+    // second source of truth. The counter only tells the navigator that it changed.
+    private val _selectedServerFilter = MutableStateFlow(prefs.getString(KEY_SERVERS_LAST_GROUP, "all") ?: "all")
+    val selectedServerFilter: StateFlow<String> = _selectedServerFilter
+
+    fun selectServerFilter(filter: String) {
+        _selectedServerFilter.value = filter
+        prefs.edit().putString(KEY_SERVERS_LAST_GROUP, filter).apply()
+    }
+
+    private val _serverGroupFocus = MutableStateFlow(0)
+    val serverGroupFocus: StateFlow<Int> = _serverGroupFocus
+    private var consumedServerGroupFocus = 0
+
+    private fun focusServerGroup(group: String) {
+        selectServerFilter(group)
+        _serverGroupFocus.update { it + 1 }
+    }
+
+    /** A file or link opened from outside the app always lands in the default group. */
+    fun focusDefaultServerGroup() = focusServerGroup(SERVER_GROUP_MANUAL)
+
+    /**
+     * The user-made group an import should land in: the group currently open on the
+     * Servers tab / dashboard, but only when it is a custom one. "All", "Default" and
+     * subscription groups return null, which keeps the historic Default behaviour
+     * (a subscription group cannot own hand-imported servers).
+     */
+    private fun importTargetGroup(): ServerGroupUiModel? {
+        val current = prefs.getString(KEY_SERVERS_LAST_GROUP, null) ?: return null
+        return serverGroups.value.firstOrNull { it.id == current.removePrefix("group:") }
+    }
+
+    /**
+     * True exactly once per request, so a recreate() (language change) does not
+     * replay the last import's navigation.
+     */
+    fun consumeServerGroupFocus(): Boolean {
+        val pending = _serverGroupFocus.value
+        if (pending == consumedServerGroupFocus) return false
+        consumedServerGroupFocus = pending
+        return true
+    }
+
+    // Classification parses the payload, so it never runs on the caller's thread:
+    // a shared file or a pasted blob can be megabytes of links.
+    fun prepareImportText(text: String?) {
+        viewModelScope.launch(Dispatchers.Default) {
+            if (requestProfilePassword(text)) return@launch
+            val state = classifiedImportState(text)
+            withContext(Dispatchers.Main) { _importState.value = state }
+        }
+    }
+
+    private fun classifiedImportState(text: String?): ImportUiState =
+        when (val classification = ImportClassifier.classify(text)) {
+            is ImportClassification.Rejected -> ImportUiState(
+                phase = ImportPhaseUi.ERROR,
+                title = "Nothing to import",
+                message = classification.message
+            )
+            is ImportClassification.Ready -> ImportUiState(
+                phase = ImportPhaseUi.AWAITING,
+                kind = if (classification.kind == ImportKind.SUBSCRIPTION) {
+                    ImportKindUi.SUBSCRIPTION
+                } else ImportKindUi.CONFIG,
+                raw = classification.normalized,
+                title = if (classification.kind == ImportKind.SUBSCRIPTION) {
+                    "Import subscription?"
+                } else "Import server config?",
+                message = if (classification.kind == ImportKind.SUBSCRIPTION) {
+                    "The link will be downloaded and added as a subscription."
+                } else "Supported servers will be added to Default."
+            )
+        }
+
+    /**
+     * Deep-linked / shared / picked content: the stream is read on IO and aborted
+     * past the parser's byte limit, so a hostile ACTION_SEND cannot freeze the UI
+     * thread or exhaust the heap before any size check runs.
+     */
+    fun prepareImportFromUri(context: Context, uri: android.net.Uri, asFile: Boolean) {
+        val resolver = context.contentResolver
+        viewModelScope.launch(Dispatchers.IO) {
+            val content = readBoundedStream(resolver, uri)
+            if (requestProfilePassword(content)) return@launch
+            val state = when {
+                content == null -> ImportUiState(
+                    phase = ImportPhaseUi.ERROR,
+                    title = "Nothing to import",
+                    message = "The file is empty, unreadable or exceeds the " +
+                        "${LinkParser.MAX_IMPORT_BYTES / 1024 / 1024} MiB import limit"
+                )
+                asFile -> fileImportState(content)
+                else -> classifiedImportState(content)
+            }
+            withContext(Dispatchers.Main) { _importState.value = state }
+        }
+    }
+
+    private fun readBoundedStream(
+        resolver: android.content.ContentResolver,
+        uri: android.net.Uri
+    ): String? = runCatching {
+        resolver.openInputStream(uri)?.use { input ->
+            val output = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var total = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > LinkParser.MAX_IMPORT_BYTES) return@use null
+                output.write(buffer, 0, count)
+            }
+            output.toByteArray().toString(Charsets.UTF_8).takeIf { it.isNotBlank() }
+        }
+    }.getOrNull()
+
+    fun dismissImport() {
+        if (_importState.value.phase != ImportPhaseUi.IMPORTING) {
+            _importState.value = ImportUiState()
+        }
+    }
+
+    fun confirmImport() {
+        val pending = _importState.value
+        if (pending.phase != ImportPhaseUi.AWAITING || pending.kind == null) return
+        _importState.value = pending.copy(phase = ImportPhaseUi.IMPORTING, message = "Importing…")
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                when (pending.kind) {
+                    ImportKindUi.SUBSCRIPTION -> {
+                        val url = (ImportClassifier.classify(pending.raw) as? ImportClassification.Ready)
+                            ?.takeIf { it.kind == ImportKind.SUBSCRIPTION }?.normalized
+                            ?: error("Invalid subscription URL")
+                        val sub = SubscriptionEntity(
+                            name = when {
+                                url.startsWith("incy://", ignoreCase = true) -> "Incy"
+                                url.startsWith("happ://", ignoreCase = true) -> "Happ"
+                                else -> url.substringAfter("://").substringBefore('/').take(80)
+                            },
+                            url = url
+                        )
+                        subscriptionDao.insertSubscription(sub)
+                        val imported = try {
+                            refreshSubscriptionInternal(sub, rethrow = true)
+                        } catch (error: Exception) {
+                            nodeDao.deleteNodesBySubscription(sub.id)
+                            subscriptionDao.deleteSubscriptionById(sub.id)
+                            throw error
+                        }
+                        if (imported <= 0) {
+                            nodeDao.deleteNodesBySubscription(sub.id)
+                            subscriptionDao.deleteSubscriptionById(sub.id)
+                            error("Subscription contains no supported servers")
+                        }
+                        // Open the server list on the group that just appeared.
+                        focusServerGroup(sub.id)
+                        emitEvent(LumenEvent.ServerAdded)
+                        _importState.value = ImportUiState(
+                            phase = ImportPhaseUi.SUCCESS,
+                            title = "Subscription imported",
+                            message = "$imported server(s) added"
+                        )
+                    }
+                    ImportKindUi.CONFIG -> {
+                        val (parsed, errors) = parseImportedProfiles(pending.raw)
+                        errors.take(3).forEach { log("Import warning: $it") }
+                        val valid = parsed.filter {
+                            it.link.startsWith(ProtectedProfileCodec.PREFIX) ||
+                                com.lumen.core.config.crypto.LumenProfilePayload.isValidForImport(it)
+                        }.take(LinkParser.MAX_IMPORT_NODES)
+                        if (valid.isEmpty()) error("No supported server configs found")
+                        val entities = valid.map { it.toEntity(null) }
+                        db.withTransaction { nodeDao.insertNodes(entities) }
+                        // A user-made group that is currently open owns the import: only
+                        // subscriptions and "all" fall back to Default. Assignment is keyed
+                        // the same way as a manual move, so the servers stay in the group.
+                        val target = importTargetGroup()
+                        if (target != null) {
+                            serverGroupDao.assignNodes(entities.map { it.groupKey() }.distinct(), target.id)
+                        }
+                        focusServerGroup(target?.id ?: SERVER_GROUP_MANUAL)
+                        emitEvent(LumenEvent.ServerAdded)
+                        val destinationName = target?.name ?: com.lumen.ui.screens.stringsForLanguage(_settings.value.language).manual
+                        _importState.value = ImportUiState(
+                            phase = ImportPhaseUi.SUCCESS,
+                            title = "Import complete",
+                            message = "${valid.size} server(s) added to $destinationName"
+                        )
+                        log("Imported ${valid.size} node(s) into $destinationName")
+                    }
+                    null -> error("Import request expired")
+                }
+            } catch (e: Exception) {
+                val reason = e.message?.take(240) ?: "Unknown import error"
+                _importState.value = ImportUiState(
+                    phase = ImportPhaseUi.ERROR,
+                    title = "Import failed",
+                    message = reason
+                )
+                log("Import failed: $reason")
+            }
+        }
+    }
+
+    @Deprecated("Use prepareImportText so untrusted input requires confirmation")
+    fun importText(text: String) = prepareImportText(text)
+
+    /**
+     * Like [prepareImportText] but for files: bypasses the clipboard-size limit,
+     * reads charset-safe bytes, and skips the 1 MiB ImportClassifier gate.
+     * For files we trust the user selected them intentionally, so we go straight
+     * to the parser and show a confirmation dialog with the result count.
+     */
+    fun prepareImportFileContent(content: String?) {
+        viewModelScope.launch(Dispatchers.Default) {
+            if (requestProfilePassword(content)) return@launch
+            val state = fileImportState(content)
+            withContext(Dispatchers.Main) { _importState.value = state }
+        }
+    }
+
+    private fun fileImportState(content: String?): ImportUiState {
+        if (content.isNullOrBlank()) {
+            return ImportUiState(
+                phase = ImportPhaseUi.ERROR,
+                title = "Nothing to import",
+                message = "The file is empty"
+            )
+        }
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        if (bytes.size > LinkParser.MAX_IMPORT_BYTES) {
+            return ImportUiState(
+                phase = ImportPhaseUi.ERROR,
+                title = "File too large",
+                message = "File exceeds the ${LinkParser.MAX_IMPORT_BYTES / 1024 / 1024} MiB import limit"
+            )
+        }
+        // Decrypt only on confirmation, so previewing a closed profile does not
+        // create an orphaned encrypted store entry or require its password twice.
+        if (ProtectedProfileCodec.isEnvelope(content)) return classifiedImportState(content)
+        // Quick-check: if it's a bare http/https URL treat it as a subscription URL.
+        val trimmed = content.trim()
+        if (!trimmed.contains('\n') && (trimmed.startsWith("http://") || trimmed.startsWith("https://"))) {
+            return classifiedImportState(trimmed)
+        }
+        // Pre-parse so we can show a meaningful summary before the user confirms.
+        val (parsed, parseErrors) = try {
+            parseImportedProfiles(content)
+        } catch (e: Exception) {
+            return ImportUiState(
+                phase = ImportPhaseUi.ERROR,
+                title = "File parse error",
+                message = e.message?.take(240) ?: "Unknown error"
+            )
+        }
+        val valid = parsed.filter {
+            com.lumen.core.config.crypto.LumenProfilePayload.isValidForImport(it)
+        }.take(LinkParser.MAX_IMPORT_NODES)
+        if (valid.isEmpty()) {
+            return ImportUiState(
+                phase = ImportPhaseUi.ERROR,
+                title = "No supported servers",
+                message = if (parseErrors.isNotEmpty()) parseErrors.take(3).joinToString("\n") else "No recognised server configs found in file"
+            )
+        }
+        return ImportUiState(
+            phase = ImportPhaseUi.AWAITING,
+            kind = ImportKindUi.CONFIG,
+            raw = content,
+            title = "Import from file?",
+            message = "${valid.size} server(s) found. They will be added to Default."
+        )
+    }
+
+    private val _profilePasswordRequest = MutableStateFlow<String?>(null)
+    val profilePasswordRequest: StateFlow<String?> = _profilePasswordRequest
+    private val _profilePasswordBusy = MutableStateFlow(false)
+    val profilePasswordBusy: StateFlow<Boolean> = _profilePasswordBusy
+    private val _profilePasswordError = MutableStateFlow(false)
+    val profilePasswordError: StateFlow<Boolean> = _profilePasswordError
+    private var profilePasswordGeneration = 0L
+
+    private suspend fun requestProfilePassword(content: String?): Boolean {
+        if (content == null || !com.lumen.core.config.crypto.LumenProfileEnvelope.requiresPassword(content)) return false
+        withContext(Dispatchers.Main) {
+            profilePasswordGeneration++
+            _profilePasswordRequest.value = content
+            _profilePasswordError.value = false
+            _profilePasswordBusy.value = false
+            _importState.value = ImportUiState()
+        }
+        return true
+    }
+
+    fun dismissProfilePassword() {
+        profilePasswordGeneration++
+        _profilePasswordRequest.value = null
+        _profilePasswordBusy.value = false
+        _profilePasswordError.value = false
+    }
+
+    fun unlockProfile(password: String) {
+        val envelope = _profilePasswordRequest.value ?: return
+        if (_profilePasswordBusy.value) return
+        val generation = profilePasswordGeneration
+        _profilePasswordBusy.value = true
+        _profilePasswordError.value = false
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                val secret = password.toCharArray()
+                try { runCatching { ProtectedProfiles.unlockForImport(envelope, secret) } }
+                finally { secret.fill('\u0000') }
+            }
+            if (generation != profilePasswordGeneration) return@launch
+            _profilePasswordBusy.value = false
+            result.onSuccess { unlocked ->
+                _profilePasswordRequest.value = null
+                prepareImportText(unlocked)
+            }.onFailure { _profilePasswordError.value = true }
+        }
+    }
+
+    private fun parseImportedProfiles(text: String): Pair<List<ParsedNode>, List<String>> =
+        if (ProtectedProfileCodec.isEnvelope(text)) ProtectedProfiles.parse(text, getApplication()) else LinkParser.parseLinksText(text)
+
+    data class OpenVpnCredentialRequest(val nodeId: String, val name: String,
+        val missing: com.lumen.core.config.parser.OpenVpnMissingCredentials)
+    private val _openVpnCredentialRequest = MutableStateFlow<OpenVpnCredentialRequest?>(null)
+    val openVpnCredentialRequest: StateFlow<OpenVpnCredentialRequest?> = _openVpnCredentialRequest
+    fun dismissOpenVpnCredentials() { _openVpnCredentialRequest.value = null }
+    fun supplyOpenVpnCredentials(username: String, password: String, keyPassword: String, onReady: () -> Unit) {
+        val request = _openVpnCredentialRequest.value ?: return
+        if ((request.missing.username && username.isBlank()) || (request.missing.password && password.isBlank()) ||
+            (request.missing.keyPassword && keyPassword.isBlank())) return
+        val previous = sessionOpenVpnSecrets[request.nodeId] ?: com.lumen.core.config.parser.OpenVpnSecrets()
+        val secret = com.lumen.core.config.parser.OpenVpnSecrets(
+            username.ifEmpty { previous.username }, password.ifEmpty { previous.password }, keyPassword.ifEmpty { previous.keyPassword })
+        sessionOpenVpnSecrets[request.nodeId] = secret
+        _openVpnCredentialRequest.value = null
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    db.withTransaction {
+                        val entity = checkNotNull(nodeDao.getNodesByIds(listOf(request.nodeId)).singleOrNull())
+                        // A closed .lumen envelope must never be replaced with plaintext.
+                        if (!entity.link.startsWith(ProtectedProfileCodec.PREFIX)) {
+                            val stored = com.lumen.core.config.parser.OpenVpnCredentials.persist(parseStoredEntity(entity), secret)
+                            check(nodeDao.updateConfiguration(entity.id, stored.link, LinkParser.toJsonString(stored.outbound)) == 1)
+                        }
+                    }
+                }
+                if (_selectedNodeId.value == request.nodeId) onReady()
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) {
+                _connectError.value = com.lumen.ui.screens.LumenProfileText.CREDENTIALS_SAVE_FAILED.inLanguage(_settings.value.language)
+            }
+        }
+    }
+
+    private fun ParsedNode.toEntity(subscriptionId: String?): NodeEntity {
+        if (link.startsWith(ProtectedProfileCodec.PREFIX)) return NodeEntity(name = name,
+            protocol = "locked", server = "", port = 0, link = link, subscriptionId = subscriptionId)
+        return NodeEntity(
+        name = name.ifBlank { server },
+        protocol = scheme,
+        server = server,
+        port = port,
+        link = link,
+        outboundJson = if (outbound.isNotEmpty()) LinkParser.toJsonString(outbound) else "",
+        subscriptionId = subscriptionId,
+        isAutoNode = scheme == "auto"
+    )
+    }
+
+    // ---------- Subscriptions ----------
+    private val subEntities: StateFlow<List<SubscriptionEntity>> = subscriptionDao.getSubscriptions()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    private val _subscriptionPremium = MutableStateFlow<Map<String, Map<String, String>>>(emptyMap())
+    // The usage figures live in _subscriptionUsage: they are the raw
+    // subscription-userinfo values, so they can be merged and persisted per key.
+    // Everything else the panel says about the subscription — the announcement, the
+    // support / website / premium links, the banner — is a column on the entity.
+    private val _subscriptionUsage = MutableStateFlow(loadSubscriptionUsage())
+
+    val subscriptions: StateFlow<List<SubscriptionUiModel>> =
+        combine(subEntities, nodeEntities, _subscriptionPremium, _subscriptionUsage) { subs, allNodes, premium, usage ->
+            val now = System.currentTimeMillis()
+            subs.map { s ->
+                val info = usage[s.id].orEmpty()
+                SubscriptionUiModel(
+                    id = s.id,
+                    name = s.name,
+                    url = s.url,
+                    lastUpdated = s.lastUpdated,
+                    nodeCount = allNodes.count { it.subscriptionId == s.id },
+                    autoUpdateEnabled = s.autoUpdateEnabled,
+                    premiumFeatureCount = premium[s.id]?.size ?: 0,
+                    trafficSummary = info.takeIf { it.isNotEmpty() }?.let(SubscriptionUsage::summary),
+                    expiryDaysLeft = SubscriptionUsage.expiryEpochSeconds(info)
+                        ?.let { SubscriptionUsage.daysLeft(it, now) },
+                    trafficRatio = SubscriptionUsage.ratio(info),
+                    updateIntervalHours = s.updateIntervalHours.takeIf { it > 0 },
+                    announce = s.announce.ifBlank { null },
+                    announceUrl = s.announceUrl.ifBlank { null },
+                    description = s.description.ifBlank { null },
+                    telegramUrl = s.telegramUrl.ifBlank { null },
+                    supportUrl = s.supportUrl.ifBlank { null },
+                    supportEmail = s.supportEmail.ifBlank { null },
+                    websiteUrl = s.websiteUrl.ifBlank { null },
+                    premiumUrl = s.premiumUrl.ifBlank { null },
+                    bannerText = s.bannerText.ifBlank { null },
+                    bannerButtonText = s.bannerButtonText.ifBlank { null },
+                    bannerButtonUrl = s.bannerButtonUrl.ifBlank { null },
+                    bannerBgColor = s.bannerBgColor.ifBlank { null },
+                    bannerButtonColor = s.bannerButtonColor.ifBlank { null },
+                    hideUrl = s.hideUrl,
+                    sortOrder = s.sortOrder.ifBlank { null }
+                )
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /**
+     * The panel only reports usage while a refresh is running, and the figures used to
+     * live in memory only: every process restart blanked the traffic and expiry rows
+     * until the next successful update. They are kept in prefs instead, one line per
+     * subscription, with an empty field for a value the panel has never sent.
+     */
+    private fun loadSubscriptionUsage(): Map<String, Map<String, Long>> =
+        prefs.getString(KEY_SUBSCRIPTION_USAGE, "").orEmpty().lineSequence().mapNotNull { line ->
+            val parts = line.split('|')
+            if (parts.size != USAGE_KEYS.size + 1 || parts[0].isBlank()) return@mapNotNull null
+            val info = linkedMapOf<String, Long>()
+            USAGE_KEYS.forEachIndexed { index, key ->
+                parts[index + 1].toLongOrNull()?.takeIf { it >= 0L }?.let { info[key] = it }
+            }
+            if (info.isEmpty()) null else parts[0] to info.toMap()
+        }.toMap()
+
+    private fun persistSubscriptionUsage(usage: Map<String, Map<String, Long>>) {
+        val text = usage.entries.joinToString("\n") { (id, info) ->
+            USAGE_KEYS.joinToString("|", prefix = "$id|") { key -> info[key]?.toString().orEmpty() }
+        }
+        prefs.edit().putString(KEY_SUBSCRIPTION_USAGE, text).apply()
+    }
+
+    /**
+     * Merges one refresh into the stored figures. Only the keys the panel actually sent
+     * are replaced: a response that omits `expire`, or that came back through a fallback
+     * User-Agent whose answer carries no `subscription-userinfo` header at all, must not
+     * reset a known good value to zero.
+     */
+    private fun mergeSubscriptionUsage(subscriptionId: String, fresh: Map<String, Long>) {
+        if (fresh.isEmpty()) return
+        val merged = SubscriptionUsage.merge(_subscriptionUsage.value[subscriptionId].orEmpty(), fresh)
+        _subscriptionUsage.value = _subscriptionUsage.value + (subscriptionId to merged)
+        persistSubscriptionUsage(_subscriptionUsage.value)
+    }
+
+    private fun forgetSubscriptionUsage(subscriptionId: String) {
+        if (subscriptionId !in _subscriptionUsage.value) return
+        _subscriptionUsage.value = _subscriptionUsage.value - subscriptionId
+        persistSubscriptionUsage(_subscriptionUsage.value)
+    }
+
+    private val _refreshingIds = MutableStateFlow<Set<String>>(emptySet())
+    val refreshingIds: StateFlow<Set<String>> = _refreshingIds
+
+    // lastUpdated only advances on a successful refresh, so a failing or empty
+    // subscription would stay due forever and be retried on every 60 s tick.
+    private val subscriptionFailures = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val subscriptionRetryAfter = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // Declared here (not in the top init block) so every field the loop touches exists.
+    init { startSubscriptionAutoUpdate() }
+
+    /** Subscriptions the app ships with. They are added when missing and cannot be removed in the UI. */
+    private val builtInSubscriptions = listOf(
+        "UcAmnezia" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcAmnezia.txt",
+        "UcSubot" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcSubot.txt",
+        "Uciran" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciran.txt",
+        "Uciranir" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciranir.txt",
+        "UcOvpn" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UcOvpn.txt",
+        "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt"
+    )
+
+    /** Inserts every built-in subscription whose URL is not stored yet; returns how many were added. */
+    private suspend fun addMissingBuiltInSubscriptions(): Int = subscriptionMutations.withLock {
+        val known = subscriptionDao.getSubscriptions().first().map { it.url }.toSet()
+        val missing = builtInSubscriptions.filter { (_, url) -> url !in known }
+        missing.forEach { (name, url) -> subscriptionDao.insertSubscription(SubscriptionEntity(name = name, url = url)) }
+        missing.size
+    }
+
+    /** Refreshes every stored subscription, adding any missing built-in ones first. */
+    /** [respectBackoff] skips subscriptions that failed recently; the manual button always retries. */
+    fun refreshAllSubscriptions(respectBackoff: Boolean = false) {
+        viewModelScope.launch(Dispatchers.IO) {
+            addMissingBuiltInSubscriptions()
+            subscriptionDao.getSubscriptions().first().forEach { sub ->
+                if (respectBackoff && System.currentTimeMillis() < (subscriptionRetryAfter[sub.id] ?: 0L)) return@forEach
+                launch { refreshSubscriptionInternal(sub) }
+            }
+        }
+    }
+
+    init {
+        // A fresh install starts with the built-in subscriptions already loaded.
+        viewModelScope.launch(Dispatchers.IO) {
+            if (addMissingBuiltInSubscriptions() > 0) refreshAllSubscriptions()
+        }
+    }
+
+    private var lastEmptyServersRefreshAt = 0L
+
+    init {
+        // Whenever the app has no servers, refresh the subscriptions so configs appear on their own.
+        // The cooldown stops a failing network from re-running the refresh in a loop.
+        viewModelScope.launch(Dispatchers.IO) {
+            nodeDao.getNodes().map { it.isEmpty() }.distinctUntilChanged().collect { empty ->
+                if (!empty) return@collect
+                val now = System.currentTimeMillis()
+                if (now - lastEmptyServersRefreshAt < 120_000L) return@collect
+                lastEmptyServersRefreshAt = now
+                refreshAllSubscriptions(respectBackoff = true)
+            }
+        }
+    }
+
+    fun addSubscription(name: String, url: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val sub = SubscriptionEntity(
+                name = name.ifBlank { url.substringAfter("://").take(40) },
+                url = url
+            )
+            subscriptionDao.insertSubscription(sub)
+            log("Added subscription ${sub.name}")
+            if (refreshSubscriptionInternal(sub, adoptProfileTitle = name.isBlank()) > 0) {
+                focusServerGroup(sub.id)
+                emitEvent(LumenEvent.ServerAdded)
+            }
+        }
+    }
+
+    /**
+     * Updates only user-owned subscription fields. Nodes and provider metadata stay intact
+     * until the user refreshes the subscription from its new URL.
+     *
+     * Validation is synchronous so the edit dialog can stay open and mark invalid input.
+     */
+    fun updateSubscription(model: SubscriptionUiModel, name: String, url: String): Boolean {
+        val edit = validateSubscriptionEdit(
+            existingUrl = model.url,
+            name = name,
+            url = url,
+            allowHttp = _settings.value.subscriptionAllowHttp
+        ) ?: return false
+        viewModelScope.launch(Dispatchers.IO) {
+            subscriptionMutations.withLock {
+                val current = subscriptionDao.getSubscriptionSnapshot(model.id) ?: return@withLock
+                subscriptionDao.updateSubscription(current.copy(name = edit.name, url = edit.url))
+                log("Updated subscription ${edit.name}")
+            }
+        }
+        return true
+    }
+
+    fun refreshSubscription(model: SubscriptionUiModel) {
+        viewModelScope.launch(Dispatchers.IO) {
+            subEntities.value.firstOrNull { it.id == model.id }?.let {
+                refreshSubscriptionInternal(it)
+            }
+        }
+    }
+
+    fun refreshSubscription(subscriptionId: String) {
+        val model = subscriptions.value.firstOrNull { it.id == subscriptionId } ?: return
+        refreshSubscription(model)
+    }
+
+    private suspend fun refreshSubscriptionInternal(
+        sub: SubscriptionEntity,
+        rethrow: Boolean = false,
+        adoptProfileTitle: Boolean = false,
+        automatic: Boolean = false
+    ): Int {
+        // Claim atomically: a StateFlow read+write does not serialize concurrent imports.
+        if (!subscriptionRefreshClaims.add(sub.id)) return 0
+        _refreshingIds.update { it + sub.id }
+        val startedEpoch = subscriptionRefreshEpoch.get()
+        var importedCount = 0
+        try {
+            val requested = subscriptionDao.getSubscriptionSnapshot(sub.id) ?: return 0
+            if (requested.url != sub.url) return 0
+            fun accepts(current: SubscriptionEntity?): Boolean = canApplySubscriptionRefresh(
+                automatic, startedEpoch, subscriptionRefreshEpoch.get(),
+                _settings.value.subscriptionAutoUpdateMinutes,
+                current?.autoUpdateEnabled == true, requested.url, current?.url
+            )
+            if (!accepts(requested)) return 0
+            currentCoroutineContext().ensureActive()
+            val subscriptionSettings = _settings.value
+            val fetchJob = currentCoroutineContext()[Job]
+            val fetchEpoch = subscriptionRefreshEpoch.get()
+            val payload = SubscriptionClient.fetch(
+                rawUrl = requested.url,
+                hwid = subscriptionSettings.subscriptionHwid.trim()
+                    .takeIf { subscriptionSettings.subscriptionSendHwid && it.isNotBlank() },
+                customUserAgent = subscriptionSettings.subscriptionUserAgent.trim().ifBlank { null },
+                direct = subscriptionSettings.subscriptionDirect,
+                allowHttp = subscriptionSettings.subscriptionAllowHttp,
+                proxyPort = subscriptionSettings.localSocksPort.takeIf {
+                    subscriptionSettings.subscriptionUseProxyTun && LumenVpnService.isRunning.value
+                },
+                proxyUsername = subscriptionSettings.socks5Username.takeIf { subscriptionSettings.socks5AuthEnabled },
+                proxyPassword = subscriptionSettings.socks5Password.takeIf { subscriptionSettings.socks5AuthEnabled },
+                cancelled = {
+                    fetchJob?.isActive == false || (automatic &&
+                        (subscriptionRefreshEpoch.get() != fetchEpoch ||
+                            normalizedSubscriptionAutoUpdateMinutes(_settings.value.subscriptionAutoUpdateMinutes) == 0))
+                }
+            )
+            currentCoroutineContext().ensureActive()
+            if (!accepts(subscriptionDao.getSubscriptionSnapshot(sub.id))) return 0
+            val (parsed, errors) = LinkParser.parseLinksText(payload.body)
+            errors.take(3).forEach { log("Subscription warning: $it") }
+            val valid = parsed.filter {
+                it.name.length <= 512 && it.server.length <= 512 &&
+                    (it.scheme == "auto" || it.server.isNotBlank()) &&
+                    (it.scheme == "auto" || it.port in 1..65535) && it.link.length <= 65_536
+            }.take(LinkParser.MAX_IMPORT_NODES)
+            if (valid.isEmpty()) {
+                noteSubscriptionFailure(sub.id)
+                log("Subscription ${requested.name}: no nodes found; existing nodes kept")
+                return 0
+            }
+            subscriptionMutations.withLock {
+                val current = subscriptionDao.getSubscriptionSnapshot(sub.id)
+                if (current == null || !accepts(current)) return@withLock
+                var committed: SubscriptionReconciliation? = null
+                db.withTransaction {
+                    val latest = subscriptionDao.getSubscriptionSnapshot(sub.id)
+                    if (latest == null || !accepts(latest)) return@withTransaction
+                    val previous = nodeDao.getSubscriptionNodesSnapshot(sub.id)
+                    // A partial parse must never turn a parser/format failure into data deletion.
+                    if (!canReplaceSubscriptionNodes(previous.size, parsed.size, valid.size, errors.size)) {
+                        noteSubscriptionFailure(sub.id)
+                        log("Subscription ${latest.name}: incomplete response; existing nodes kept")
+                        return@withTransaction
+                    }
+                    val result = reconcileSubscriptionNodes(previous, valid.map { it.toEntity(sub.id) })
+                    val replacementUrl = if (SubscriptionClient.isEncryptedSource(latest.url)) {
+                        null
+                    } else {
+                        (payload.effectiveUrl
+                            ?: SubscriptionClient.replaceDomain(latest.url, payload.premiumFeatures["new-domain"]))
+                            ?.takeIf { candidate ->
+                                subscriptionSettings.subscriptionAllowHttp ||
+                                    !latest.url.startsWith("https://", true) || candidate.startsWith("https://", true)
+                            }
+                    }
+                    // Favourites keep their row and heart; unfavourited rows are replaced by the fresh list.
+                    val favorites = nodeDao.getFavoriteNodesForSubscription(sub.id).associateBy { it.link }
+                    nodeDao.deleteUnfavoriteNodesBySubscription(sub.id)
+                    nodeDao.insertNodes(result.nodes.map { n ->
+                        favorites[n.link]?.let { n.copy(id = it.id, favorite = true) } ?: n
+                    })
+                    subscriptionDao.updateSubscription(
+                        mergeSubscriptionMetadata(
+                            latest, payload.metadata, payload.updateIntervalHours?.takeIf { it in 1..8760 }
+                        ).copy(
+                            name = refreshedSubscriptionName(latest.name, payload.profileTitle, adoptProfileTitle),
+                            url = replacementUrl ?: latest.url,
+                            lastUpdated = System.currentTimeMillis(),
+                            // A provider header is not permission to override a user's opt-out.
+                            autoUpdateEnabled = latest.autoUpdateEnabled
+                        )
+                    )
+                    currentCoroutineContext().ensureActive()
+                    if (!accepts(latest)) throw CancellationException("Subscription settings changed")
+                    committed = result
+                }
+                val result = committed ?: return@withLock
+                importedCount = result.nodes.size
+                _subscriptionSummaries.tryEmit(
+                    SubscriptionUpdateSummary(current.name, result.added, result.updated, result.removed, importedCount)
+                )
+                _subscriptionPremium.update { it + (sub.id to payload.premiumFeatures) }
+                mergeSubscriptionUsage(sub.id, payload.userInfo)
+                val premiumApplied = applyCompatiblePremiumFeatures(payload.premiumFeatures)
+                subscriptionFailures.remove(sub.id)
+                subscriptionRetryAfter.remove(sub.id)
+                log("Subscription ${current.name}: $importedCount node(s), profile ${payload.clientProfile}")
+                if (premiumApplied.isNotEmpty()) log("Applied premium settings: ${premiumApplied.joinToString()}")
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            noteSubscriptionFailure(sub.id)
+            log("Subscription refresh failed: ${e.message}")
+            if (rethrow) throw e
+        } finally {
+            _refreshingIds.update { it - sub.id }
+            subscriptionRefreshClaims.remove(sub.id)
+        }
+        return importedCount
+    }
+
+    fun deleteSubscription(model: SubscriptionUiModel) {
+        viewModelScope.launch(Dispatchers.IO) {
+            subscriptionMutations.withLock {
+                db.withTransaction {
+                    val keys = nodeDao.getSubscriptionNodesSnapshot(model.id).map { it.groupKey() }
+                    nodeDao.deleteUnfavoriteNodesBySubscription(model.id)
+                    nodeDao.detachFavoriteNodesFromSubscription(model.id)
+                    subscriptionDao.deleteSubscriptionById(model.id)
+                    if (keys.isNotEmpty()) serverGroupDao.assignNodes(keys, null)
+                }
+                forgetSubscriptionUsage(model.id)
+                _subscriptionPremium.update { it - model.id }
+                subscriptionFailures.remove(model.id)
+                subscriptionRetryAfter.remove(model.id)
+                log("Deleted subscription ${model.name}")
+            }
+        }
+    }
+
+    fun deleteSubscription(subscriptionId: String) {
+        val model = subscriptions.value.firstOrNull { it.id == subscriptionId } ?: return
+        deleteSubscription(model)
+    }
+
+    // Global OFF and a disabled subscription are hard vetoes, even with provider cadence.
+    private fun startSubscriptionAutoUpdate() {
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(60_000L)
+                if (_settings.value.subscriptionAutoUpdateMinutes <= 0 || !hasNetworkConnection()) continue
+                val now = System.currentTimeMillis()
+                for (sub in subEntities.value) {
+                    val intervalMinutes = subscriptionAutomaticIntervalMinutes(
+                        _settings.value.subscriptionAutoUpdateMinutes, sub.autoUpdateEnabled, sub.updateIntervalHours
+                    ) ?: continue
+                    val due = now - sub.lastUpdated >= intervalMinutes * 60_000L
+                    val backedOff = now < (subscriptionRetryAfter[sub.id] ?: 0L)
+                    if (due && !backedOff && sub.id !in subscriptionRefreshClaims) {
+                        try {
+                            refreshSubscriptionInternal(sub, automatic = true)
+                        } catch (cancelled: CancellationException) {
+                            // A settings epoch cancellation ends this request, not the scheduler.
+                            currentCoroutineContext().ensureActive()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Exponential backoff so an expired or offline subscription is not retried every minute. */
+    private fun noteSubscriptionFailure(subscriptionId: String) {
+        val failures = (subscriptionFailures[subscriptionId] ?: 0) + 1
+        subscriptionFailures[subscriptionId] = failures
+        val backoffMinutes = (5L shl (failures - 1).coerceAtMost(6)).coerceAtMost(360L)
+        subscriptionRetryAfter[subscriptionId] =
+            System.currentTimeMillis() + backoffMinutes * 60_000L
+    }
+
+    private fun hasNetworkConnection(): Boolean = runCatching {
+        val manager = getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val network = manager.activeNetwork ?: return@runCatching false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return@runCatching false
+        capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }.getOrDefault(true)
+
+    /**
+     * Resolvers of the currently active physical network. Only ever called while the
+     * VPN is down, so `activeNetwork` is the underlay; the scope suffix of a
+     * link-local address is stripped because nothing downstream can carry it.
+     */
+    private fun currentNetworkDnsServers(): List<String> = runCatching {
+        val manager = getApplication<Application>()
+            .getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val network = manager.activeNetwork ?: return@runCatching emptyList()
+        manager.getLinkProperties(network)?.dnsServers
+            ?.mapNotNull { it.hostAddress?.substringBefore('%') }
+            ?.distinct()
+            .orEmpty()
+    }.getOrDefault(emptyList())
+
+    private fun premiumEnabled(value: String): Boolean =
+        value.trim().lowercase(Locale.US) in setOf("1", "true", "yes", "on", "enabled")
+
+    private fun applyCompatiblePremiumFeatures(premium: Map<String, String>): List<String> {
+        if (premium.isEmpty() || !_settings.value.allowSubscriptionOverrides) return emptyList()
+        val applied = mutableListOf<String>()
+        var next = _settings.value
+
+        premium["subscription-autoconnect"]?.let {
+            next = next.copy(autoConnectOnBoot = premiumEnabled(it))
+            applied += "subscription-autoconnect"
+        }
+        premium["fragmentation-enable"]?.let {
+            next = next.copy(fragmentEnabled = premiumEnabled(it))
+            applied += "fragmentation-enable"
+        }
+        premium["fragmentation-packets"]?.takeIf { it.isNotBlank() }?.let {
+            next = next.copy(fragmentPackets = it.take(64)); applied += "fragmentation-packets"
+        }
+        premium["fragmentation-length"]?.takeIf { it.isNotBlank() }?.let {
+            next = next.copy(fragmentLength = it.take(32)); applied += "fragmentation-length"
+        }
+        premium["fragmentation-interval"]?.takeIf { it.isNotBlank() }?.let {
+            next = next.copy(fragmentDelay = it.take(32)); applied += "fragmentation-interval"
+        }
+        premium["mux-enable"]?.let {
+            next = next.copy(muxEnabled = premiumEnabled(it)); applied += "mux-enable"
+        }
+        premium["mux-tcp-connections"]?.toIntOrNull()?.coerceIn(-1, 1024)?.let {
+            next = next.copy(muxConcurrency = it); applied += "mux-tcp-connections"
+        }
+        // Both of these used to write prefs directly, so _settings kept the stale
+        // value and the next settings save overwrote the provider's override.
+        premium["change-user-agent"]?.trim()?.takeIf {
+            it.isNotBlank() && it.length <= 256 && '\r' !in it && '\n' !in it
+        }?.let {
+            next = next.copy(subscriptionUserAgent = it)
+            applied += "change-user-agent"
+        }
+        // The ping method belongs to the user. Periodic subscription refreshes
+        // must not reset it, even when other provider overrides are enabled.
+        if (next != _settings.value) updateSettings(next)
+
+        premium["per-app-proxy-mode"]?.trim()?.lowercase(Locale.US)?.let { mode ->
+            val mapped = when (mode) {
+                "allow", "allow-list", "include", "whitelist", "1" -> SplitModeUi.ALLOW_LIST
+                "disallow", "disallow-list", "exclude", "blacklist", "2" -> SplitModeUi.DISALLOW_LIST
+                "off", "disabled", "0" -> SplitModeUi.DISABLED
+                else -> null
+            }
+            if (mapped != null) {
+                setSplitMode(mapped)
+                applied += "per-app-proxy-mode"
+            }
+        }
+        premium["per-app-proxy-list"]?.let { raw ->
+            val packages = raw.split(Regex("[\\s,;]+"))
+                .map { it.trim() }
+                .filter { it.matches(Regex("[A-Za-z0-9_.]+")) }
+                .take(500)
+                .toSet()
+            if (packages.isNotEmpty()) {
+                _splitPackages.value = packages
+                prefs.edit().putStringSet("split_packages", packages).apply()
+                applied += "per-app-proxy-list"
+            }
+        }
+        return applied
+    }
+
+    // ---------- Ping ----------
+    private val _isPinging = MutableStateFlow(false)
+    val isPinging: StateFlow<Boolean> = _isPinging
+    private val _testingNodeId = MutableStateFlow<String?>(null)
+    val testingNodeId: StateFlow<String?> = _testingNodeId
+    private val _serverTestResults = MutableStateFlow<Map<String, String>>(emptyMap())
+    val serverTestResults: StateFlow<Map<String, String>> = _serverTestResults
+    private val _pingingNodeIds = MutableStateFlow<Set<String>>(emptySet())
+    val pingingNodeIds: StateFlow<Set<String>> = _pingingNodeIds.coalesceUiUpdates()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptySet())
+    private val _bulkPingProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+    val bulkPingProgress: StateFlow<Pair<Int, Int>?> = _bulkPingProgress
+    private var bulkPingProgressReset: Job? = null
+
+    private var bulkPingJob: kotlinx.coroutines.Job? = null
+    private var bulkPingGeneration = 0L
+    private val singlePingJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
+
+    // The outer scheduler honours the configured count for ICMP too.
+    private val icmpSemaphore = kotlinx.coroutines.sync.Semaphore(128)
+    // AUTO pools can contain hundreds of endpoints. Probe them concurrently, but keep one
+    // shared ceiling across all AUTO nodes so large subscriptions cannot exhaust sockets.
+    private val autoMemberPingSemaphore =
+        kotlinx.coroutines.sync.Semaphore(PingBudget.AUTO_MEMBER_CONCURRENCY)
+    // A real HTTP test starts an isolated sing-box proxy for the target node.
+    // Honour the configured worker count, including 16. Each temporary Go core uses
+    // one scheduler thread; the user's concurrency setting remains the CPU budget.
+    private val realPingSemaphore = kotlinx.coroutines.sync.Semaphore(PingBudget.CORE_PING_CONCURRENCY)
+    // Port discovery releases its temporary socket before sing-box binds it. Serialize
+    // only that short startup phase so two probes cannot race for the same local port.
+    private val realPingStartupMutex = Mutex()
+    private val coreBinaryMissingLogged = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    fun pingAll() {
+        pingNodeListInternal(nodeEntities.value)
+    }
+
+    fun pingGroup(subscriptionId: String?) {
+        val targets = nodeEntities.value.filter { it.subscriptionId == subscriptionId }
+        pingNodeListInternal(targets)
+    }
+
+    fun pingNodes(nodes: List<NodeUiModel>) {
+        val nodeIds = nodes.map { it.id }.toSet()
+        val targets = nodeEntities.value.filter { it.id in nodeIds }
+        pingNodeListInternal(targets)
+    }
+
+    fun stopPing() {
+        val wasRunning = bulkPingJob?.isActive == true || _isPinging.value
+        bulkPingGeneration += 1
+        bulkPingProgressReset?.cancel()
+        _bulkPingProgress.value = null
+        bulkPingJob?.cancel()
+        bulkPingJob = null
+        singlePingJobs.values.forEach { it.cancel() }
+        singlePingJobs.clear()
+        resetConnectedPing()
+        _pingingNodeIds.value = emptySet()
+        _testingNodeId.value = null
+        _isPinging.value = false
+        if (wasRunning) log("Ping stopped")
+    }
+
+    // Amnezia first, then OpenVPN, then SSTP, then everything else (matches the list order).
+    private fun pingProtocolRank(protocol: String): Int = when (protocol.trim().lowercase(Locale.US)) {
+        "awg", "amneziawg", "amnezia" -> 0
+        "openvpn" -> 1
+        "sstp" -> 2
+        else -> 3
+    }
+
+    private fun pingNodeListInternal(targets: List<NodeEntity>) {
+        if (targets.isEmpty()) return
+        val cfg = _settings.value
+        val mode = cfg.pingType
+        // A mixed TCPing list can still redirect UDP-only nodes to the core path. Keep
+        // the outer worker count aligned with realPingSemaphore: queued rows otherwise
+        // spent their entire per-node deadline waiting for a slot and became false 0s.
+        val containsCoreBackedChecks = cfg.pingType in CORE_PING_TYPES ||
+            (cfg.pingType == "tcping" && targets.any {
+                it.protocol.trim().lowercase(Locale.US) in UDP_ONLY_SCHEMES
+            })
+        val limit = if (containsCoreBackedChecks) {
+            cfg.pingConcurrency.coerceIn(1, PingBudget.CORE_PING_CONCURRENCY)
+        } else {
+            cfg.pingConcurrency.coerceIn(1, 128)
+        }
+        // A new request always supersedes the old one. This makes every run start from a
+        // clean slate even if the user changes a group or starts another check mid-flight.
+        val predecessor = bulkPingJob
+        stopPing()
+        val generation = ++bulkPingGeneration
+        _bulkPingProgress.value = 0 to targets.size
+        _isPinging.value = true
+        val job = viewModelScope.launch(
+            Dispatchers.IO,
+            start = kotlinx.coroutines.CoroutineStart.LAZY
+        ) {
+            predecessor?.cancelAndJoin()
+            _isPinging.value = true
+            log("Pinging ${targets.size} node(s), $limit at a time ($mode)…")
+            try {
+                // Drop stale values first: the row must show "measuring", not the previous ping.
+                val targetIds = targets.map { it.id }
+                _serverTestResults.update { it - targetIds.toSet() }
+                _pingingNodeIds.update { it + targetIds }
+                nodeDao.updatePingsBatch(targetIds.map { Pair(it, null as Int?) })
+                val pending = java.util.Collections.synchronizedSet(targetIds.toMutableSet())
+                val completedPings = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
+                val semaphore = kotlinx.coroutines.sync.Semaphore(limit)
+                // Same protocol order as the server list; AUTO pools stay last.
+                val ordered = targets.sortedWith(
+                    compareBy<NodeEntity>({ it.isAutoNode || it.protocol.equals("auto", true) },
+                        { pingProtocolRank(it.protocol) })
+                )
+                // Plain HTTP nodes share one temporary core per group; everything else is a single-node unit.
+                val batchAllowed = mode == "http" && cfg.pingAttempts == 1
+                val units = ArrayList<List<NodeEntity>>()
+                var group = ArrayList<NodeEntity>()
+                for (node in ordered) {
+                    if (!(batchAllowed && canBatchPing(node))) {
+                        units.add(listOf(node))
+                        continue
+                    }
+                    group.add(node)
+                    if (group.size == PING_BATCH_SIZE) {
+                        units.add(group)
+                        group = ArrayList()
+                    }
+                }
+                if (group.isNotEmpty()) units.add(group)
+                val jobs = units.map { unit ->
+                    async {
+                        try {
+                            semaphore.withPermit {
+                                val batched = if (unit.size > 1) batchProxyPing(unit) else emptyMap()
+                                for (node in unit) {
+                                    try {
+                                        // Repeats the probe and aggregates it per the ping settings.
+                                        val ping = batched[node.id] ?: measureNodePing(node)
+                                        val persistedPing = ping.coerceAtLeast(0)
+                                        currentCoroutineContext().ensureActive()
+                                        nodeDao.updatePing(node.id, persistedPing)
+                                        completedPings[node.id] = persistedPing
+                                    } catch (e: kotlinx.coroutines.CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        // One failing node must not abort the run for all the others.
+                                        runCatching {
+                                            nodeDao.updatePing(node.id, 0)
+                                            completedPings[node.id] = 0
+                                        }
+                                        log("Ping failed for ${node.name}: ${e.message}")
+                                    } finally {
+                                        // Runs on the cancellation path too, so no row stays measuring.
+                                        synchronized(pending) {
+                                            pending.remove(node.id)
+                                            if (bulkPingGeneration == generation) {
+                                                _pingingNodeIds.update { it - node.id }
+                                                _bulkPingProgress.value = (targets.size - pending.size) to targets.size
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            log("Ping group failed: ${e.message}")
+                        }
+                    }
+                }
+                // Every node already carries its own deadline; this is the backstop that
+                // keeps the run finite when a straggler is stuck in a blocking probe.
+                val finished = withTimeoutOrNull(PingBudget.batchMs(targets.size, limit)) {
+                    jobs.awaitAll()
+                } != null
+                if (!finished) {
+                    jobs.forEach { it.cancel() }
+                    val leftovers = synchronized(pending) { pending.toList() }
+                    runCatching { nodeDao.updatePingsBatch(leftovers.map { Pair(it, 0 as Int?) }) }
+                    log("Ping deadline reached: ${leftovers.size} node(s) marked unreachable")
+                }
+                if (finished && cfg.pingAutoDeleteUnreachable) {
+                    val removed = removeUnhealthyNodesAfterPing(
+                        completedPings = completedPings.toMap(),
+                        thresholdMs = cfg.pingAutoDeleteThresholdMs
+                    )
+                    if (removed > 0) log("Auto-removed $removed node(s) after the ping test")
+                }
+                log("Ping finished for ${targets.size} node(s)")
+            } finally {
+                // A canceled predecessor must not reset state owned by its replacement.
+                if (bulkPingGeneration == generation) {
+                    bulkPingJob = null
+                    _pingingNodeIds.update { it - targets.map { node -> node.id }.toSet() }
+                    _isPinging.value = false
+                    bulkPingProgressReset = viewModelScope.launch {
+                        delay(500)
+                        if (bulkPingGeneration == generation) _bulkPingProgress.value = null
+                    }
+                }
+            }
+        }
+        bulkPingJob = job
+        job.start()
+    }
+
+    fun pingNode(node: NodeUiModel) {
+        if (node.id in _pingingNodeIds.value) return
+        val generation = bulkPingGeneration
+        _pingingNodeIds.update { it + node.id }
+        val job = viewModelScope.launch(Dispatchers.IO, start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            _testingNodeId.value = node.id
+            // update{} instead of read-modify-write: parallel pings share these sets.
+            _pingingNodeIds.update { it + node.id }
+            // Old value is dropped before measuring so the row never shows a stale ping.
+            _serverTestResults.update { it - node.id }
+            try {
+                // Same repeat/aggregate rules as the bulk check.
+                val entity = nodeEntities.value.firstOrNull { it.id == node.id }
+                val ping = entity?.let { measureNodePing(it) } ?: -1
+                currentCoroutineContext().ensureActive()
+                val persistedPing = ping.coerceAtLeast(0)
+                nodeDao.updatePing(node.id, persistedPing)
+                val result = if (ping > 0) "$ping ms" else "0"
+                _serverTestResults.update { it + (node.id to result) }
+                log("Ping ${node.name}: $result")
+                if (
+                    _settings.value.pingAutoDeleteUnreachable &&
+                    isPingRemovalCandidate(persistedPing, _settings.value.pingAutoDeleteThresholdMs)
+                ) {
+                    val removed = removeUnhealthyNodesAfterPing(
+                        completedPings = mapOf(node.id to persistedPing),
+                        thresholdMs = _settings.value.pingAutoDeleteThresholdMs
+                    )
+                    if (removed > 0) log("Auto-removed ${node.name} after the ping test")
+                }
+            } finally {
+                // A thrown or cancelled measurement must not leave the row spinning.
+                if (generation == bulkPingGeneration) {
+                    singlePingJobs.remove(node.id)
+                    _pingingNodeIds.update { it - node.id }
+                    if (_testingNodeId.value == node.id) _testingNodeId.value = null
+                }
+            }
+        }
+        singlePingJobs[node.id] = job
+        job.start()
+    }
+
+    /**
+     * "Check" button on the dashboards: measures the server that is selected/connected
+     * right now with the ping method chosen in settings and reports it as a Toast.
+     * The value is kept in [_connectedPing] so it can also be shown next to the button.
+     */
+    fun checkConnectedPing(unreachableLabel: String, noServerLabel: String) {
+        val node = activeNode.value
+        if (node == null) {
+            emitToast(noServerLabel)
+            return
+        }
+        if (_checkingConnectedPing.value) {
+            resetConnectedPing()
+            return
+        }
+        val generation = ++connectedPingGeneration
+        _checkingConnectedPing.value = true
+        connectedPingJob = viewModelScope.launch(Dispatchers.IO) {
+            _checkingConnectedPing.value = true
+            _connectedPing.value = null
+            try {
+                val entity = nodeEntities.value.firstOrNull { it.id == node.id }
+                val ping = entity?.let { measureNodePing(it) } ?: -1
+                currentCoroutineContext().ensureActive()
+                if (entity != null) nodeDao.updatePing(entity.id, ping.coerceAtLeast(0))
+                val label = if (ping > 0) "$ping ms" else unreachableLabel
+                if (generation != connectedPingGeneration || activeNode.value?.id != node.id) {
+                    return@launch
+                }
+                _connectedPing.value = label
+                _serverTestResults.update { it + (node.id to label) }
+                emitToast("${node.name}: $label")
+                log("Check ping ${node.name}: $label")
+            } finally {
+                if (generation == connectedPingGeneration) {
+                    _checkingConnectedPing.value = false
+                    connectedPingJob = null
+                }
+            }
+        }
+    }
+
+    private val _connectedPing = MutableStateFlow<String?>(null)
+    val connectedPing: StateFlow<String?> = _connectedPing
+
+    private val _checkingConnectedPing = MutableStateFlow(false)
+    val checkingConnectedPing: StateFlow<Boolean> = _checkingConnectedPing
+    private var connectedPingJob: Job? = null
+    private var connectedPingGeneration = 0L
+
+    private fun resetConnectedPing() {
+        connectedPingGeneration += 1
+        connectedPingJob?.cancel()
+        connectedPingJob = null
+        _connectedPing.value = null
+        _checkingConnectedPing.value = false
+    }
+
+    fun exportNodesText(nodeIds: Set<String>): String {
+        val allEntities = nodeEntities.value.associateBy { it.id }
+        return com.lumen.core.config.parser.NodeExportNormalizer.exportAll(
+            nodeIds.mapNotNull { id -> allEntities[id]?.takeUnless { it.link.startsWith(ProtectedProfileCodec.PREFIX) }?.let(::parseEntity) }
+        )
+    }
+
+    fun exportLumenConfig(nodeId: String): String {
+        val entity = requireNotNull(nodeEntities.value.firstOrNull { it.id == nodeId })
+        require(!entity.link.startsWith(ProtectedProfileCodec.PREFIX)) { "Protected profiles cannot be exported" }
+        return com.lumen.core.config.crypto.LumenProfilePayload.encode(listOf(parseEntity(entity)))
+    }
+
+    fun exportSubscriptionText(subscriptionId: String?): String {
+        val targets = nodeEntities.value.filter { it.subscriptionId == subscriptionId && !it.link.startsWith(ProtectedProfileCodec.PREFIX) }
+        return com.lumen.core.config.parser.NodeExportNormalizer.exportAll(targets.map(::parseEntity))
+    }
+
+    private fun pingTimeout(): Int = _settings.value.pingTimeoutMs.coerceIn(500, 20_000)
+
+    /**
+     * Overall wall-clock ceiling for one node, derived from the configured timeout,
+     * retry count and retry delay so it always tracks the user's ping settings.
+     * [pingWithin] turns an expired budget into "unreachable" instead of a row that
+     * keeps measuring: the user asked for it to go to 0 rather than spin.
+     */
+    private suspend fun pingWithin(
+        entity: NodeEntity,
+        memberCount: Int,
+        realCheck: Boolean,
+        block: suspend kotlinx.coroutines.CoroutineScope.() -> Int
+    ): Int {
+        val cfg = _settings.value
+        val budget = PingBudget.nodeMs(
+            PingBudget.attemptsMs(
+                timeoutMs = cfg.pingTimeoutMs,
+                attempts = cfg.pingAttempts,
+                retryDelayMs = cfg.pingRetryDelayMs,
+                realCheck = realCheck,
+                iranNetwork = geoRegionCode(cfg.geoResourceSource) == "ir"
+            ),
+            memberCount,
+            if (realCheck) PingBudget.CORE_PING_CONCURRENCY else PingBudget.AUTO_MEMBER_CONCURRENCY
+        )
+        val measured = withTimeoutOrNull(budget, block)
+        if (measured == null) log("Ping deadline reached for ${entity.name}")
+        return measured ?: -1
+    }
+
+    private suspend fun measureAttempts(probe: suspend () -> Int): Int {
+        val cfg = _settings.value
+        val attempts = cfg.pingAttempts.coerceIn(1, 10)
+        val retryDelay = cfg.pingRetryDelayMs.coerceIn(0, 5_000).toLong()
+        val samples = ArrayList<Int>(attempts)
+        repeat(attempts) { index ->
+            currentCoroutineContext().ensureActive()
+            if (index > 0 && retryDelay > 0) kotlinx.coroutines.delay(retryDelay)
+            val value = probe()
+            // Zero is the UI's unreachable sentinel. A successful local round trip can
+            // legitimately take less than one millisecond, so never store it as failure.
+            if (value >= 0) samples.add(value.coerceAtLeast(1))
+        }
+        if (samples.isEmpty()) return -1
+        return when (cfg.pingAggregate) {
+            "avg" -> samples.average().toInt()
+            "median" -> samples.sorted()[samples.size / 2]
+            else -> samples.min()
+        }
+    }
+
+    /**
+     * The method a given node is actually probed with.
+     *
+     * WireGuard/AmneziaWG (and WARP, which is WireGuard underneath) endpoints only
+     * listen on UDP, so the TCP connect behind TCPing can never complete and every one
+     * of those rows read 0 ms. They are redirected to the core backed check, which
+     * measures an HTTP request through the node and is protocol agnostic. ICMP is left
+     * alone: it probes the host address and works for a UDP endpoint as it is.
+     */
+    private fun effectivePingType(protocol: String): String {
+        val method = _settings.value.pingType
+        if (method != "tcping") return method
+        return if (protocol.trim().lowercase(Locale.US) in UDP_ONLY_SCHEMES) "http" else method
+    }
+
+    /**
+     * One node's repeats. [node] is only resolved for the checks that need a full
+     * config, so a TCPing run over a large subscription still parses nothing.
+     */
+    private suspend fun measureNodeAttempts(
+        protocol: String,
+        host: String,
+        port: Int,
+        node: () -> ParsedNode
+    ): Int {
+        val method = effectivePingType(protocol)
+        if (method in CORE_PING_TYPES) {
+            val parsed = node()
+            return proxyPingAttempts(parsed)
+        }
+        return measureAttempts { if (method == "icmp") icmpPing(host) else tcpPing(host, port) }
+    }
+
+    /**
+     * AUTO nodes have no endpoint of their own. Desktop Lumen resolves their
+     * selector/urltest members before probing; do the same here and keep the
+     * best reachable member as the AUTO latency.
+     */
+    private suspend fun measureNodePing(entity: NodeEntity): Int {
+        // The SOCKS detour only exists while the SSTP bridge runs, so probe the server directly.
+        if (entity.protocol.equals("sstp", ignoreCase = true)) return tcpPing(entity.server, entity.port)
+        if (entity.link.startsWith(ProtectedProfileCodec.PREFIX)) {
+            val resolved = parseEntity(entity)
+            return proxyPingAttempts(resolved)
+        }
+        val liveSession = LumenVpnService.activeProxySession.value
+        if (LumenVpnService.isRunning.value && entity.id == activeNode.value?.id &&
+            effectivePingType(entity.protocol) in CORE_PING_TYPES && liveSession != null) {
+            return pingWithin(entity, memberCount = 1, realCheck = true) {
+                measureAttempts {
+                    var result = -1
+                    for (url in httpPingTargets(_settings.value.pingUrl,
+                        iranNetwork = geoRegionCode(_settings.value.geoResourceSource) == "ir")) {
+                        currentCoroutineContext().ensureActive()
+                        result = try {
+                            httpDelayThroughSocks(liveSession.port, url, pingTimeout(), liveSession.username, liveSession.password)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            log("Connected ping: ${e.message?.takeIf { it.startsWith("Probe stage:") } ?: e.javaClass.simpleName}")
+                            -1
+                        }
+                        if (result > 0) break
+                    }
+                    result
+                }
+            }
+        }
+        val isAuto = entity.isAutoNode || entity.protocol.equals("auto", true)
+        if (!isAuto) {
+            val realCheck = effectivePingType(entity.protocol) in CORE_PING_TYPES
+            // A core-backed probe starts its deadline only after obtaining a core slot.
+            // AUTO members and individual probes share that pool with bulk checks.
+            if (realCheck) return measureNodeAttempts(entity.protocol, entity.server, entity.port) { parseEntity(entity) }
+            return pingWithin(entity, memberCount = 1, realCheck = false) {
+                measureNodeAttempts(entity.protocol, entity.server, entity.port) { parseEntity(entity) }
+            }
+        }
+
+        val members = runCatching { LinkParser.autoMembers(parseEntity(entity).outbound) }
+            .getOrDefault(emptyList())
+            .filter { it.server.isNotBlank() && it.port in 1..65535 }
+        if (members.isEmpty()) return -1
+
+        // The old sequential loop multiplied the full timeout by every member (hundreds for
+        // Auto WiFi). A shared semaphore keeps this bounded while still checking the full pool.
+        val realCheck = members.any { effectivePingType(it.scheme) in CORE_PING_TYPES }
+        val completedSamples = java.util.concurrent.ConcurrentLinkedQueue<Int>()
+        val measured = pingWithin(entity, memberCount = members.size, realCheck = realCheck) {
+            members.map { member ->
+                async {
+                    autoMemberPingSemaphore.withPermit {
+                        val sample = try {
+                            measureNodeAttempts(member.scheme, member.server, member.port) { member }
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            -1
+                        }
+                        if (sample > 0) completedSamples.add(sample)
+                        sample
+                    }
+                }
+            }.awaitAll()
+                .filter { it >= 0 }
+                .minOrNull()
+                ?: -1
+        }
+        // A slow/dead member must not erase a proven successful member when the
+        // pool reaches its bounded deadline. User cancellation still propagates.
+        return if (measured > 0) measured else completedSamples.minOrNull() ?: -1
+    }
+
+    /**
+     * Deletes only rows whose just-completed result is still present in Room. A timed-out
+     * batch never calls this method, and a result that changed during the test is retained.
+     * The selected live tunnel is protected so cleanup cannot interrupt a connection.
+     */
+    /** Deletes servers whose ping test ran and failed (stored as 0). Never-tested servers (null) are kept. */
+    fun removeNoPingServers() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val failed = nodeEntities.value.filter { it.pingMs == 0 && !it.favorite }.associate { it.id to 0 }
+            if (failed.isEmpty()) return@launch
+            val removed = removeUnhealthyNodesAfterPing(completedPings = failed, thresholdMs = Int.MAX_VALUE)
+            log("Removed $removed server(s) without ping")
+        }
+    }
+
+    private suspend fun removeUnhealthyNodesAfterPing(
+        completedPings: Map<String, Int>,
+        thresholdMs: Int
+    ): Int {
+        val candidateIds = completedPings
+            .filter { (id, _) ->
+                id != _selectedNodeId.value ||
+                    (!LumenVpnService.isRunning.value && !LumenVpnService.isStarting.value)
+            }
+            .filter { (_, ping) -> isPingRemovalCandidate(ping, thresholdMs) }
+            .keys
+            .toList()
+        if (candidateIds.isEmpty()) return 0
+
+        val confirmed = nodeDao.getNodesByIds(candidateIds).filter { node ->
+            !node.favorite && completedPings[node.id] == node.pingMs &&
+                isPingRemovalCandidate(node.pingMs, thresholdMs)
+        }
+        if (confirmed.isEmpty()) return 0
+
+        val keys = confirmed.map { it.groupKey() }
+        confirmed.forEach { nodeDao.deleteNodeById(it.id) }
+        if (keys.isNotEmpty()) serverGroupDao.assignNodes(keys, null)
+
+        if (_selectedNodeId.value in confirmed.map { it.id }) {
+            _selectedNodeId.value = null
+            prefs.edit()
+                .remove("selected_node_id")
+                .remove("selected_node_name")
+                .remove("selected_node_name_b64")
+                .apply()
+            com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(getApplication())
+        }
+        return confirmed.size
+    }
+
+    /**
+     * A hijacking carrier does not answer a blocked hostname with NXDOMAIN, it
+     * answers with the address of its own block page - Iran's 10.10.34.0/24 being
+     * the widespread case - and that box accepts TCP on every port within a few
+     * milliseconds. The probe would therefore report a healthy latency for a
+     * server that cannot pass a single byte, which is exactly the "ping shows
+     * numbers that are not real" report. Anything that is not routable unicast is
+     * treated the same way.
+     */
+    private fun isSinkholeAddress(address: java.net.InetAddress): Boolean {
+        if (address.isAnyLocalAddress || address.isLoopbackAddress ||
+            address.isLinkLocalAddress || address.isMulticastAddress
+        ) {
+            return true
+        }
+        val octets = address.address
+        return octets.size == 4 &&
+            (octets[0].toInt() and 0xFF) == 10 &&
+            (octets[1].toInt() and 0xFF) == 10 &&
+            (octets[2].toInt() and 0xFF) == 34
+    }
+
+    /**
+     * Resolves the endpoint here instead of letting connect() do it, so a poisoned
+     * answer is discarded before anything is timed. An empty list means every
+     * address the resolver returned was a sinkhole: unreachable, not fast.
+     */
+    private suspend fun resolveProbeAddresses(host: String): List<java.net.InetAddress> =
+        ProbeIo.run { resolveProbeAddressesBlocking(host) }
+
+    private fun resolveProbeAddressesBlocking(host: String): List<java.net.InetAddress> =
+        runCatching {
+            if (geoRegionCode(_settings.value.geoResourceSource) == "ir") TrustedEndpointResolver.resolve(host)
+            else java.net.InetAddress.getAllByName(host).toList()
+        }
+            .getOrDefault(emptyList())
+            .filterNot(::isSinkholeAddress)
+
+    private suspend fun tcpPing(host: String, port: Int, timeoutMs: Int = pingTimeout()): Int {
+        val addresses = resolveProbeAddresses(host)
+        if (addresses.isEmpty()) return -1
+        // A dual-stack endpoint can advertise an unusable AAAA on an IPv4-only
+        // carrier, so a failing address falls through to the next one instead of
+        // condemning the whole node.
+        for (address in addresses) {
+            currentCoroutineContext().ensureActive()
+            val measured = try {
+                val start = System.nanoTime()
+                ProbeIo.socket { it.connect(InetSocketAddress(address, port), timeoutMs) }
+                ((System.nanoTime() - start) / 1_000_000).toInt()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) { null }
+            if (measured != null) return measured
+        }
+        return -1
+    }
+
+    private suspend fun icmpPing(host: String, timeoutMs: Int = pingTimeout()): Int = try {
+        icmpSemaphore.withPermit {
+            val address = resolveProbeAddresses(host).firstOrNull()
+            if (address == null) {
+                -1
+            } else {
+                val start = System.nanoTime()
+                if (ProbeIo.run { address.isReachable(timeoutMs) }) {
+                    ((System.nanoTime() - start) / 1_000_000).toInt()
+                } else {
+                    -1
+                }
+            }
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        -1
+    }
+
+    /**
+     * Desktop Lumen's "Real HTTP" check starts a temporary proxy for the node
+     * and measures an HTTP request through it. The old Android URL check was a
+     * direct request and therefore returned nearly the same result for every
+     * server without proving that any node could pass traffic.
+     *
+     * The proxy is the node's own outbound, so this works for every protocol the core
+     * speaks — including WireGuard/AmneziaWG, which has no TCP port to connect to.
+     * The timer covers only the HTTP request/status response, excluding connection setup
+     * and socket teardown. Legacy Real HTTP selections migrate to this one method.
+     */
+    private suspend fun proxyPingAttempts(node: ParsedNode): Int {
+        val cfg = _settings.value
+        val budget = PingBudget.attemptsMs(cfg.pingTimeoutMs, cfg.pingAttempts, cfg.pingRetryDelayMs,
+            realCheck = true, iranNetwork = geoRegionCode(cfg.geoResourceSource) == "ir")
+        return withPingProbeSlot(realPingSemaphore, budget.coerceAtMost(PingBudget.MAX_NODE_MS)) { proxyPingWithCore(node) } ?: -1
+    }
+
+    private suspend fun proxyPingWithCore(node: ParsedNode): Int {
+        val app = getApplication<Application>()
+        val binary = File(app.applicationInfo.nativeLibraryDir, "libsingbox.so")
+        if (!binary.isFile) {
+            // Otherwise every row just shows an unexplained -1.
+            if (coreBinaryMissingLogged.compareAndSet(false, true)) {
+                log("VPN core missing for this CPU architecture: real ping unavailable")
+            }
+            return -1
+        }
+        val bridge = obfsBridgeOf(node)
+        // Use the same anti-hijacking address pinning as a normal connection. Without
+        // this the tunnel may work while its ping-only core resolves the endpoint to an
+        // Iranian carrier's block-page address and reports 0.
+        val pinnedServers = ProbeIo.run { runCatching {
+            ServerAddressPinner.pinnedAddresses(
+                hostnames = listOf(node.server),
+                foreignResolver = _settings.value.dnsDirectServers.lineSequence()
+                    .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
+                preferSystemDns = geoRegionCode(_settings.value.geoResourceSource) == "ir"
+            )
+        }.getOrDefault(emptyMap()) }
+        val workDir = File(app.cacheDir, "ping-tests/${UUID.randomUUID()}").apply { mkdirs() }
+        val configFile = File(workDir, "config.json")
+        var socksPort = 0
+        var obfsPort = SingboxConfigBuilder.OBFS_LOCAL_PORT
+        var process: Process? = null
+        var xrayProcess: Process? = null
+        val coreDiagnostics = ArrayDeque<String>()
+        fun drainCore(child: Process, engine: String) {
+            Thread({
+                runCatching { child.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line ->
+                        if (!node.isProtected) synchronized(coreDiagnostics) {
+                            coreDiagnostics.addLast("$engine: ${com.lumen.core.engine.ProcessEngine.stripAnsi(line).take(700)}")
+                            while (coreDiagnostics.size > 8) coreDiagnostics.removeFirst()
+                        }
+                    }
+                } }
+            }, "lumen-ping-$engine-log").apply { isDaemon = true; start() }
+        }
+        var succeeded = false
+        var relay: ObfsRelay? = null
+        return try {
+            val ready = realPingStartupMutex.withLock {
+                socksPort = runCatching { ServerSocket(0).use { it.localPort } }.getOrDefault(0)
+                if (socksPort <= 0) return@withLock null
+                obfsPort = if (bridge != null) {
+                    availableTcpPort(setOf(socksPort)).takeIf { it > 0 } ?: return@withLock null
+                } else {
+                    SingboxConfigBuilder.OBFS_LOCAL_PORT
+                }
+                if (bridge != null) {
+                    relay = ObfsRelay(
+                        localPort = obfsPort,
+                        type = bridge.first,
+                        bridgeHost = bridge.second,
+                        bridgePort = bridge.third,
+                        // Lumen's UID is excluded from its own VpnService; the temporary
+                        // relay therefore already dials the physical network.
+                        protect = { true }
+                    ).also { it.start() }
+                }
+                configFile.writeText(
+                    HybridConfigBuilder.buildConfig(
+                        node, pingSingboxOptions(socksPort, obfsPort, workDir, pinnedServers),
+                        CoreMode.of(_settings.value.engine), { availableTcpPort(setOf(socksPort, obfsPort)) }
+                    ),
+                    Charsets.UTF_8
+                )
+                val runtimeJson = JSONObject(configFile.readText())
+                runtimeJson.optJSONObject(HybridConfigBuilder.SIDECAR_KEY)?.let { sidecar ->
+                    val xrayConfig = File(workDir, "xray.json").apply { writeText(sidecar.toString()) }
+                    xrayProcess = ProcessBuilder(File(app.applicationInfo.nativeLibraryDir, "libxray.so").absolutePath,
+                        "run", "-c", xrayConfig.absolutePath).apply {
+                        environment()["GOMAXPROCS"] = "1"
+                        redirectErrorStream(true)
+                    }.start()
+                    xrayProcess?.let { drainCore(it, "Xray") }
+                    runtimeJson.remove(HybridConfigBuilder.SIDECAR_KEY)
+                    configFile.writeText(runtimeJson.toString())
+                }
+                process = ProcessBuilder(binary.absolutePath, "run", "-c", configFile.absolutePath)
+                    .apply { environment()["GOMAXPROCS"] = "1" }
+                    .directory(workDir)
+                    .redirectErrorStream(true)
+                    .start()
+                val startedProcess = process ?: return@withLock null
+                drainCore(startedProcess, "Singbox")
+
+                startedProcess
+            }
+            val readyProcess = ready ?: return -1
+            val readyDeadline = System.nanoTime() +
+                    pingTimeout().coerceAtLeast(2_000).toLong() * 1_000_000L
+                var listening = false
+                while (System.nanoTime() < readyDeadline && readyProcess.isAlive) {
+                    listening = runCatching {
+                        Socket().use { socket ->
+                            socket.connect(InetSocketAddress("127.0.0.1", socksPort), 100)
+                        }
+                        true
+                    }.getOrDefault(false)
+                    if (listening) break
+                    delay(50)
+                }
+            if (!listening || !readyProcess.isAlive) return -1
+
+            // Reuse one ready core for every configured attempt. Restarting the process
+            // for each sample made the next probe race the previous process teardown.
+            measureAttempts {
+                val startedProcess = process
+                if (startedProcess == null || !startedProcess.isAlive) {
+                    -1
+                } else {
+                    var result = -1
+                    val urls = httpPingTargets(_settings.value.pingUrl,
+                        iranNetwork = geoRegionCode(_settings.value.geoResourceSource) == "ir")
+                    val warmupDeadline = System.nanoTime() + PingBudget.setupMs(pingTimeout()).toLong() * 1_000_000L
+                    do {
+                        for (url in urls) {
+                            currentCoroutineContext().ensureActive()
+                            try {
+                                result = httpDelayThroughSocks(socksPort, url, pingTimeout())
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (e: Exception) {
+                                log("Ping probe ${node.name}: ${e.message?.takeIf { it.startsWith("Probe stage:") } ?: e.javaClass.simpleName}")
+                            }
+                            if (result > 0) break
+                        }
+                        if (result > 0 || !node.scheme.equals("openvpn", true) || System.nanoTime() >= warmupDeadline) break
+                        // OpenVPN's SOCKS listener can precede the remote TLS handshake.
+                        // Retry quick "endpoint not ready" failures within the startup budget.
+                        delay(250)
+                    } while (true)
+                    result
+                }
+            }.also { succeeded = it > 0 }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("Ping setup ${node.name}: ${e.javaClass.simpleName}")
+            -1
+        } finally {
+            xrayProcess?.let { child ->
+                child.destroy()
+                if (!child.waitFor(300, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                    child.destroyForcibly(); child.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)
+                }
+            }
+            process?.let {
+                runCatching { it.destroy() }
+                if (it.isAlive) runCatching { it.waitFor(1_000, TimeUnit.MILLISECONDS) }
+                if (it.isAlive) runCatching { it.destroyForcibly() }
+                if (it.isAlive) runCatching { it.waitFor(1_000, TimeUnit.MILLISECONDS) }
+            }
+            if (!succeeded && currentCoroutineContext()[Job]?.isActive != false && !node.isProtected) {
+                val diagnostic = synchronized(coreDiagnostics) { coreDiagnostics.joinToString(" | ") }
+                if (diagnostic.isNotBlank()) log("Core ping failed ${node.name}: $diagnostic")
+            }
+            runCatching { relay?.stop() }
+            runCatching { workDir.deleteRecursively() }
+        }
+    }
+
+    /**
+     * Only plain HTTP-probed nodes can share a batch core. The active node keeps its live
+     * session check, and SSTP, OpenVPN, AUTO and protected profiles keep their own paths.
+     */
+    private fun canBatchPing(node: NodeEntity): Boolean {
+        val protocol = node.protocol.trim().lowercase(Locale.US)
+        return !node.isAutoNode && protocol != "auto" && protocol != "sstp" && protocol != "openvpn" &&
+            !node.link.startsWith(ProtectedProfileCodec.PREFIX) &&
+            !(node.id == activeNode.value?.id && LumenVpnService.isRunning.value)
+    }
+
+    /**
+     * Probes a group of plain nodes through ONE temporary sing-box core. Each node keeps its
+     * own outbound, renamed so tags cannot clash, and the core's Clash API reports the delay
+     * of every outbound. Nodes that need more than a plain outbound (sidecars, obfs relays,
+     * endpoints, detours) are missing from the result, so the caller probes them one by one.
+     */
+    private suspend fun batchProxyPing(group: List<NodeEntity>): Map<String, Int> {
+        val app = getApplication<Application>()
+        val binary = File(app.applicationInfo.nativeLibraryDir, "libsingbox.so")
+        if (!binary.isFile) return emptyMap()
+        val workDir = File(app.cacheDir, "ping-tests/${UUID.randomUUID()}").apply { mkdirs() }
+        val configFile = File(workDir, "config.json")
+        val timeoutMs = pingTimeout()
+        var process: Process? = null
+        return try {
+            val settingsNow = _settings.value
+            val iran = geoRegionCode(settingsNow.geoResourceSource) == "ir"
+            val outbounds = JSONArray()
+            val probeTags = LinkedHashMap<String, String>()
+            group.forEachIndexed { index, entity ->
+                val parsed = runCatching { parseEntity(entity) }.getOrNull() ?: return@forEachIndexed
+                if (obfsBridgeOf(parsed) != null) return@forEachIndexed
+                val pinned = ProbeIo.run { runCatching {
+                    ServerAddressPinner.pinnedAddresses(
+                        hostnames = listOf(parsed.server),
+                        foreignResolver = settingsNow.dnsDirectServers.lineSequence()
+                            .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
+                        preferSystemDns = iran
+                    )
+                }.getOrDefault(emptyMap()) }
+                val json = runCatching {
+                    JSONObject(HybridConfigBuilder.buildConfig(
+                        parsed,
+                        pingSingboxOptions(0, SingboxConfigBuilder.OBFS_LOCAL_PORT, workDir, pinned),
+                        CoreMode.of(settingsNow.engine),
+                        { availableTcpPort(emptySet()) }
+                    ))
+                }.getOrNull() ?: return@forEachIndexed
+                if (json.has(HybridConfigBuilder.SIDECAR_KEY) || json.has("endpoints")) return@forEachIndexed
+                val entries = json.optJSONArray("outbounds") ?: return@forEachIndexed
+                val all = (0 until entries.length()).map { entries.getJSONObject(it) }
+                if (all.any { it.has("detour") }) return@forEachIndexed
+                val proxies = all.filter { it.optString("type") !in NON_PROXY_OUTBOUND_TYPES }
+                if (proxies.size != 1) return@forEachIndexed
+                val copy = JSONObject(proxies[0].toString())
+                if (copy.has("domain_resolver")) {
+                    // The resolver only matters for a hostname. A hostname without a usable
+                    // pinned address would resolve through system DNS, so such a node is skipped.
+                    val host = copy.optString("server")
+                    val literalIp = host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")) || host.contains(':')
+                    if (!literalIp) return@forEachIndexed
+                    copy.remove("domain_resolver")
+                }
+                val tag = "n${index}_${copy.optString("tag")}"
+                outbounds.put(copy.put("tag", tag))
+                probeTags[entity.id] = tag
+            }
+            if (probeTags.isEmpty()) return emptyMap()
+            val port = availableTcpPort(emptySet())
+            if (port <= 0) return emptyMap()
+            outbounds.put(JSONObject().put("type", "direct").put("tag", "direct"))
+            val root = JSONObject()
+                .put("log", JSONObject().put("disabled", true))
+                .put("outbounds", outbounds)
+                .put("experimental", JSONObject().put("clash_api",
+                    JSONObject().put("external_controller", "127.0.0.1:$port")))
+            configFile.writeText(root.toString(), Charsets.UTF_8)
+            val child = ProcessBuilder(binary.absolutePath, "run", "-c", configFile.absolutePath)
+                .apply { environment()["GOMAXPROCS"] = "1" }
+                .directory(workDir)
+                .redirectErrorStream(true)
+                .redirectOutput(File(workDir, "core.log"))
+                .start()
+            process = child
+            val readyDeadline = System.nanoTime() + timeoutMs.coerceAtLeast(2_000).toLong() * 1_000_000L
+            var listening = false
+            while (System.nanoTime() < readyDeadline && child.isAlive) {
+                listening = runCatching {
+                    Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 100) }
+                    true
+                }.getOrDefault(false)
+                if (listening) break
+                delay(50)
+            }
+            if (!listening || !child.isAlive) return emptyMap()
+            val url = httpPingTargets(settingsNow.pingUrl, iranNetwork = iran).first()
+            kotlinx.coroutines.coroutineScope {
+                probeTags.map { (id, tag) ->
+                    async(Dispatchers.IO) { id to clashDelay(port, tag, url, timeoutMs) }
+                }.awaitAll()
+            }.toMap()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            log("Batch ping setup failed: ${e.javaClass.simpleName}")
+            emptyMap()
+        } finally {
+            process?.let { child ->
+                runCatching { child.destroy() }
+                if (child.isAlive) runCatching { child.waitFor(1_000, TimeUnit.MILLISECONDS) }
+                if (child.isAlive) runCatching { child.destroyForcibly() }
+            }
+            runCatching { workDir.deleteRecursively() }
+        }
+    }
+
+    /** Delay of one outbound through the core's Clash API; -1 when it did not answer. */
+    private fun clashDelay(port: Int, tag: String, url: String, timeoutMs: Int): Int = try {
+        val encodedTag = java.net.URLEncoder.encode(tag, "UTF-8").replace("+", "%20")
+        val endpoint = "http://127.0.0.1:$port/proxies/$encodedTag/delay" +
+            "?timeout=$timeoutMs&url=${java.net.URLEncoder.encode(url, "UTF-8")}"
+        val conn = java.net.URL(endpoint).openConnection() as java.net.HttpURLConnection
+        try {
+            conn.connectTimeout = 2_000
+            conn.readTimeout = timeoutMs + 2_000
+            if (conn.responseCode !in 200..299) {
+                -1
+            } else {
+                JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+                    .optInt("delay", 0).takeIf { it > 0 } ?: -1
+            }
+        } finally {
+            conn.disconnect()
+        }
+    } catch (e: Exception) {
+        -1
+    }
+
+    private fun availableTcpPort(excluded: Set<Int>): Int {
+        repeat(8) {
+            val candidate = runCatching { ServerSocket(0).use { socket -> socket.localPort } }
+                .getOrDefault(0)
+            if (candidate > 0 && candidate !in excluded) return candidate
+        }
+        return 0
+    }
+
+    /**
+     * A real/HTTP ping must exercise the same core features as a connection. Keeping
+     * DNS, route, MUX, fragmentation and dial options here avoids a false green result
+     * from a stripped-down config that the actual tunnel would never use.
+     */
+    private fun pingSingboxOptions(
+        socksPort: Int,
+        obfsPort: Int,
+        workDir: File,
+        pinnedServerIps: Map<String, List<String>>
+    ): SingboxConfigOptions {
+        val s = _settings.value
+        return SingboxConfigOptions(
+            tunMode = false,
+            tunMtu = s.mtu.coerceIn(1280, 9000),
+            pinnedServerIps = pinnedServerIps,
+            localSocksPort = socksPort,
+            localHttpPort = 0,
+            allowLanConnections = false,
+            obfsLocalPort = obfsPort,
+            multiplexEnabled = s.muxEnabled,
+            multiplexConcurrency = s.muxConcurrency,
+            multiplexProtocol = s.multiplexProtocol,
+            multiplexMinStreams = s.multiplexMinStreams,
+            multiplexPadding = s.multiplexPadding,
+            multiplexBrutalEnabled = s.multiplexBrutalEnabled,
+            multiplexBrutalUpMbps = s.multiplexBrutalUpMbps,
+            multiplexBrutalDownMbps = s.multiplexBrutalDownMbps,
+            outboundTcpFastOpen = s.outboundTcpFastOpen,
+            outboundTcpMultiPath = s.outboundTcpMultiPath,
+            outboundUdpFragment = s.outboundUdpFragment,
+            outboundConnectTimeoutSeconds = s.outboundConnectTimeoutSeconds,
+            udpOverTcp = s.udpOverTcp,
+            enableFinalFragment = s.fragmentEnabled,
+            preferIpv6 = s.preferIpv6,
+            blockQuic = s.blockQuic,
+            proxyDnsServer = s.dnsProxyServers.lineSequence().firstOrNull()?.trim()
+                .orEmpty().ifBlank { "cloudflare-dns.com" },
+            directDnsServer = s.dnsDirectServers.lineSequence().firstOrNull()?.trim()
+                .orEmpty().ifBlank { "1.1.1.1" },
+            dnsMode = s.dnsMode,
+            dnsCustomJson = s.dnsCustomJson,
+            dnsDirectServers = s.dnsDirectServers.split(Regex("[\\n,;]+"))
+                .map(String::trim).filter(String::isNotEmpty),
+            systemDnsServers = currentNetworkDnsServers(),
+            dnsProxyServers = s.dnsProxyServers.split(Regex("[\\n,;]+"))
+                .map(String::trim).filter(String::isNotEmpty),
+            dnsDirectType = s.dnsDirectType,
+            dnsProxyType = s.dnsProxyType,
+            dnsDirectStrategy = s.dnsDirectStrategy,
+            dnsProxyStrategy = s.dnsProxyStrategy,
+            dnsHijackEnabled = s.dnsHijackEnabled,
+            dnsFakeIpEnabled = s.dnsFakeIpEnabled,
+            dnsParallelQuery = s.dnsParallelQuery,
+            dnsOptimisticCache = s.dnsOptimisticCache,
+            dnsGeoCheck = s.dnsGeoCheck,
+            dnsProxyIpv4Only = s.dnsProxyIpv4Only,
+            dnsHosts = s.dnsHosts.lineSequence().mapNotNull { line ->
+                val host = line.substringBefore('=').trim().trimEnd('.').lowercase()
+                val addresses = line.substringAfter('=', "").split(',')
+                    .map(String::trim).filter(String::isNotEmpty)
+                if (host.isNotBlank() && addresses.isNotEmpty()) host to addresses else null
+            }.toMap(),
+            dnsOverrideEnabled = s.dnsOverrideEnabled,
+            dnsOverrideHostname = s.dnsOverrideHostname,
+            dnsOverrideIpv4 = s.dnsOverrideIpv4,
+            logLevel = "error",
+            urlTestUrl = s.urlTestUrl.ifBlank { "https://www.gstatic.com/generate_204" },
+            urlTestIntervalMinutes = s.urlTestIntervalMinutes.coerceIn(1, 1440),
+            urlTestToleranceMs = s.urlTestToleranceMs.coerceIn(0, 5000),
+            urlTestIdleTimeoutMinutes = s.urlTestIdleTimeoutMinutes,
+            urlTestInterruptExistConnections = s.urlTestInterruptExistConnections,
+            // A reachability check must never inherit user bypass rules. Otherwise the
+            // target URL can go out through DIRECT and make a dead node look healthy.
+            bypassLan = false,
+            cacheFileEnabled = false,
+            cacheFilePath = File(workDir, "cache.db").absolutePath,
+            geoResourceSource = s.geoResourceSource,
+            directDomains = emptyList(),
+            directIpCidrs = emptyList(),
+            dnsFakeIpRangeIPv4 = prefs.getString("dns_fake_ip_range_v4", null)
+                ?.takeIf { it.isNotBlank() } ?: "198.18.0.0/15",
+            dnsFakeIpRangeIPv6 = prefs.getString("dns_fake_ip_range_v6", null)
+                ?.takeIf { it.isNotBlank() } ?: "fc00::/18",
+            dnsIndependentCache = prefs.getBoolean("dns_independent_cache", true),
+            dnsDisableCache = prefs.getBoolean("dns_disable_cache", false),
+            dnsClientSubnet = prefs.getString("dns_client_subnet", "").orEmpty().trim(),
+            domainResolverStrategy = prefs.getString("domain_resolver_strategy", "")
+                .orEmpty().trim().lowercase(Locale.US),
+            sniffTimeoutMs = prefs.getInt("sniff_timeout_ms", 0),
+            sniffers = prefs.getString("sniffers", "").orEmpty()
+                .split(Regex("[\\n,;]+"))
+                .map { it.trim().lowercase(Locale.US) }
+                .filter(String::isNotEmpty)
+        )
+    }
+
+    private suspend fun httpDelayThroughSocks(
+        socksPort: Int,
+        rawUrl: String,
+        timeoutMs: Int,
+        username: String? = null,
+        password: String? = null
+    ): Int {
+        val url = URL(rawUrl.trim().ifBlank { "https://www.gstatic.com/generate_204" })
+        val protocol = url.protocol.lowercase(Locale.US)
+        if (protocol != "http" && protocol != "https") return -1
+        val targetPort = if (url.port > 0) url.port else if (protocol == "https") 443 else 80
+        val hostBytes = url.host.toByteArray(Charsets.UTF_8)
+        if (hostBytes.isEmpty() || hostBytes.size > 255) return -1
+        val setupTimeout = PingBudget.setupMs(timeoutMs,
+            iranNetwork = geoRegionCode(_settings.value.geoResourceSource) == "ir")
+        // Failures are the expected case here, so the socket must close on every
+        // exit path — a handshake exception used to leak one fd per probe.
+        var stage = "local SOCKS connection"
+        return try { ProbeIo.socket { socket ->
+            // A fresh core has no established outbound or DNS/TLS session. This
+            // setup budget is separate from the configured HTTP response timeout.
+            socket.soTimeout = setupTimeout
+            socket.connect(InetSocketAddress("127.0.0.1", socksPort), timeoutMs)
+            stage = "SOCKS greeting"
+            val input = socket.getInputStream()
+            val output = socket.getOutputStream()
+            val authenticated = username != null
+            output.write(byteArrayOf(0x05, 0x01, if (authenticated) 0x02 else 0x00))
+            output.flush()
+            val greeting = readExactly(input, 2)
+            if (greeting[0].toInt() != 0x05 || greeting[1].toInt() != if (authenticated) 0x02 else 0x00) {
+                throw java.io.IOException("Invalid greeting")
+            }
+            if (authenticated) {
+                val user = username.orEmpty().toByteArray(Charsets.UTF_8)
+                val pass = password.orEmpty().toByteArray(Charsets.UTF_8)
+                require(user.size in 1..255 && pass.size <= 255)
+                output.write(byteArrayOf(1, user.size.toByte()) + user + byteArrayOf(pass.size.toByte()) + pass)
+                output.flush()
+                val auth = readExactly(input, 2)
+                if (auth[0].toInt() != 1 || auth[1].toInt() != 0) throw java.io.IOException("SOCKS authentication failed")
+            }
+            stage = "outbound connect/DNS"
+            output.write(
+                byteArrayOf(0x05, 0x01, 0x00, 0x03, hostBytes.size.toByte()) +
+                    hostBytes +
+                    byteArrayOf((targetPort ushr 8).toByte(), targetPort.toByte())
+            )
+            output.flush()
+            val reply = readExactly(input, 4)
+            if (reply[1].toInt() != 0x00) throw java.io.IOException("SOCKS rejected")
+            when (reply[3].toInt() and 0xFF) {
+                0x01 -> readExactly(input, 4)
+                0x03 -> readExactly(input, readExactly(input, 1)[0].toInt() and 0xFF)
+                0x04 -> readExactly(input, 16)
+                else -> return@socket -1
+            }
+            readExactly(input, 2)
+
+            stage = "TLS handshake"
+            val requestSocket: Socket = if (protocol == "https") {
+                ((SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(socket, url.host, targetPort, true) as SSLSocket).apply {
+                    soTimeout = setupTimeout
+                    // A successful handshake alone is not enough: without hostname
+                    // verification a captive portal can answer and create a false result.
+                    sslParameters = sslParameters.apply {
+                        endpointIdentificationAlgorithm = "HTTPS"
+                    }
+                    startHandshake()
+                }
+            } else {
+                socket
+            }
+            // Start after outbound/DNS/TLS setup; finish before socket/TLS teardown.
+            stage = "HTTP response"
+            val responseDelay = requestSocket.use { active ->
+                active.soTimeout = timeoutMs
+                val activeOut = active.getOutputStream()
+                val path = url.file.takeIf { it.isNotBlank() } ?: "/"
+                val requestStartedAt = System.nanoTime()
+                activeOut.write(
+                    (
+                        "GET $path HTTP/1.1\r\n" +
+                            "Host: ${url.host}\r\n" +
+                            "User-Agent: Lumen-Ping/Android\r\n" +
+                            "Connection: close\r\n\r\n"
+                        ).toByteArray(Charsets.US_ASCII)
+                )
+                activeOut.flush()
+                val status = readStatusLine(active.getInputStream())
+                val responseReceivedAt = System.nanoTime()
+                if (!isSuccessfulHttpPingStatusLine(status)) throw java.io.IOException("Invalid HTTP response")
+                ((responseReceivedAt - requestStartedAt) / 1_000_000L).toInt().coerceAtLeast(1)
+            }
+            responseDelay
+        } } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            throw java.io.IOException("Probe stage: $stage (${e.javaClass.simpleName})", e)
+        }
+    }
+
+    /** Response status line, length bounded so a hostile endpoint cannot stream forever. */
+    private fun readStatusLine(input: java.io.InputStream): String? {
+        val line = StringBuilder()
+        while (line.length < 256) {
+            val byte = input.read()
+            if (byte < 0) break
+            if (byte == '\n'.code) break
+            if (byte != '\r'.code) line.append(Char(byte))
+        }
+        return line.takeIf { it.isNotEmpty() }?.toString()
+    }
+
+    private fun readExactly(input: java.io.InputStream, count: Int): ByteArray {
+        val result = ByteArray(count)
+        var offset = 0
+        while (offset < count) {
+            val read = input.read(result, offset, count - offset)
+            if (read < 0) throw java.io.EOFException("SOCKS proxy closed the connection")
+            offset += read
+        }
+        return result
+    }
+
+    // ---------- Connection ----------
+    private val _connectionState = MutableStateFlow(ConnectionState.Disconnected)
+    val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    private val _uploadHistory = MutableStateFlow<List<Float>>(emptyList())
+    val uploadHistory: StateFlow<List<Float>> = _uploadHistory
+    private val _downloadHistory = MutableStateFlow<List<Float>>(emptyList())
+    val downloadHistory: StateFlow<List<Float>> = _downloadHistory
+
+    // Declared before the collector below, which reads it: viewModelScope dispatches
+    // on Main.immediate, so that lambda can already run while this object is built.
+    private val _connectError = MutableStateFlow<String?>(null)
+
+    /**
+     * One-shot notifications for things the user should feel rather than read. The UI
+     * collects [events] and plays a haptic tick; nothing here vibrates by itself, so the
+     * hapticsEnabled setting stays the single gate (rememberHapticTick honours it).
+     *
+     * replay = 0 and a small buffer with DROP_OLDEST: an event that nobody is collecting
+     * (app in the background) is meant to be lost, not replayed on the next resume.
+     */
+    private val _events = kotlinx.coroutines.flow.MutableSharedFlow<LumenEvent>(
+        replay = 0,
+        extraBufferCapacity = 8,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
+    val events: kotlinx.coroutines.flow.SharedFlow<LumenEvent> = _events
+
+    private fun emitEvent(event: LumenEvent) {
+        _events.tryEmit(event)
+    }
+
+    /**
+     * Short user-facing messages the UI shows as a Toast at the bottom of the screen
+     * (ping checks, subscription update summaries). Same one-shot semantics as [events]:
+     * a message nobody is collecting is dropped instead of replayed on the next resume.
+     */
+    private val _toasts = kotlinx.coroutines.flow.MutableSharedFlow<String>(
+        replay = 0,
+        extraBufferCapacity = 8,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
+    val toasts: kotlinx.coroutines.flow.SharedFlow<String> = _toasts
+
+    fun emitToast(message: String) {
+        if (message.isNotBlank()) _toasts.tryEmit(message)
+    }
+
+    /**
+     * Result of one subscription refresh. Emitted raw (numbers, not a sentence) so the
+     * UI layer can format it with the user's language strings.
+     */
+    private val _subscriptionSummaries = kotlinx.coroutines.flow.MutableSharedFlow<SubscriptionUpdateSummary>(
+        replay = 0,
+        extraBufferCapacity = 8,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST
+    )
+    val subscriptionSummaries: kotlinx.coroutines.flow.SharedFlow<SubscriptionUpdateSummary> = _subscriptionSummaries
+
+    init {
+        // The tunnel can already be up when the app is opened; that first emission is
+        // the current state, not a transition, so it must not fire "connected".
+        var sawFirstConnectionState = false
+        viewModelScope.launch {
+            combine(
+                LumenVpnService.isRunning,
+                LumenVpnService.isStarting,
+                VpnLogBus.lastError
+            ) { running, starting, error ->
+                when {
+                    running -> ConnectionState.Connected
+                    starting -> ConnectionState.Connecting
+                    error != null -> ConnectionState.Error
+                    else -> ConnectionState.Disconnected
+                }
+            }.collect { state ->
+                val previous = _connectionState.value
+                _connectionState.value = state
+                if (state != previous) stopPing()
+                // A start that failed has a specific reason - the core's own FATAL
+                // line - and it is the only thing worth showing the user. Only a
+                // failed connection attempt raises it; a tunnel that drops later
+                // must not open a dialog on top of whatever the user is doing.
+                if (state == ConnectionState.Error && previous == ConnectionState.Connecting) {
+                    VpnLogBus.lastError.value?.let { _connectError.value = it }
+                }
+                if (sawFirstConnectionState && state != previous) {
+                    when {
+                        state == ConnectionState.Connected -> emitEvent(LumenEvent.Connected)
+                        previous == ConnectionState.Connected -> emitEvent(LumenEvent.Disconnected)
+                    }
+                }
+                sawFirstConnectionState = true
+            }
+        }
+    }
+
+    private var connectTimeoutJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Why the last start attempt produced no tunnel. The navigator shows it: a config
+     * that cannot be built for a 300 member AUTO pool has to say so, not fail silently.
+     */
+    val connectError: StateFlow<String?> = _connectError
+
+    fun reportConnectError(message: String) {
+        log(message)
+        _connectError.value = message
+    }
+
+    fun dismissConnectError() {
+        _connectError.value = null
+    }
+
+    fun markConnecting() {
+        stopPing()
+        VpnLogBus.clearLastError()
+        _connectionState.value = ConnectionState.Connecting
+        // Repeated taps must not stack watchdogs racing to flip the state to Error.
+        connectTimeoutJob?.cancel()
+        connectTimeoutJob = viewModelScope.launch {
+            delay(45_000)
+            if (!LumenVpnService.isRunning.value &&
+                _connectionState.value == ConnectionState.Connecting
+            ) {
+                _connectionState.value = ConnectionState.Error
+                _connectError.value = VpnLogBus.lastError.value ?: "Connection attempt timed out"
+                log("Connection attempt timed out")
+            }
+        }
+    }
+
+    /**
+     * The quick-settings tile and widget start from the private active config file.
+     * Mark it stale as soon as a node, DNS/routing option or split-tunnel selection
+     * changes, then rebuild only from the latest state. The old file remains available
+     * to the running service, while the tile and widget refuse to start from it.
+     */
+    private fun scheduleStoredVpnConfigRefresh() {
+        storedVpnConfigRefreshJob?.cancel()
+        val application = getApplication<Application>()
+        storedVpnConfigRefreshJob = viewModelScope.launch(Dispatchers.IO) {
+            VpnStartIntentFactory.markConfigDirty(application)
+            com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(application)
+            delay(STORED_CONFIG_REFRESH_DEBOUNCE_MS)
+            while (LumenVpnService.isRunning.value || LumenVpnService.isStarting.value) {
+                delay(STORED_CONFIG_RUNNING_RETRY_MS)
+            }
+            buildStartIntent(application, reportErrors = false)
+            com.lumen.app.widget.LumenWidgetProvider.sendUpdateBroadcast(application)
+        }
+    }
+
+    /**
+     * Parsing every stored node and serialising the config is measurable work with a
+     * large subscription, so the whole build runs on IO; only the service start is
+     * left to the caller on the main thread.
+     */
+    suspend fun buildStartIntent(
+        context: Context,
+        reportErrors: Boolean = true
+    ): Intent? = withContext(Dispatchers.IO) {
+        if (reportErrors) {
+            storedVpnConfigRefreshJob?.cancel()
+            _connectError.value = null
+        }
+        if (nodes.value.isEmpty() || activeNode.value == null) {
+            if (reportErrors) reportConnectError("No active servers available to connect")
+            return@withContext null
+        }
+        val entities = nodeEntities.value
+        if (entities.isEmpty()) {
+            if (reportErrors) reportConnectError("No servers configured in database")
+            return@withContext null
+        }
+        val selected = entities.firstOrNull { it.id == _selectedNodeId.value } ?: entities.first()
+        if (selected.id != _selectedNodeId.value) {
+            // A deleted or disabled selection must not leave the tile/widget pointing
+            // at a server different from the config they are about to start.
+            persistSelectedNodeIdentity(selected.id, selected.name)
+        }
+        val parsedSelected = try { parseEntity(selected) } catch (error: Exception) {
+            if (error is com.lumen.core.config.crypto.ProfilePolicyException) {
+                if (reportErrors) reportConnectError(profilePolicyMessage(error))
+                return@withContext null
+            }
+            if (reportErrors) reportConnectError("Protected profile is unavailable in this Lumen installation")
+            return@withContext null
+        }
+        val missingCredentials = com.lumen.core.config.parser.OpenVpnCredentials.missing(parsedSelected)
+        if (missingCredentials.any) {
+            if (reportErrors) _openVpnCredentialRequest.value = OpenVpnCredentialRequest(selected.id, selected.name, missingCredentials)
+            return@withContext null
+        }
+        parsedSelected.profilePolicy?.takeIf { it.restricted }?.let { policy ->
+            try {
+                policy.requireUsable(com.lumen.core.vpn.ProfilePolicyEnforcer.effectiveNow(context))
+                if (reportErrors) com.lumen.core.vpn.ProfilePolicyEnforcer.check(context, policy.toJson())
+            }
+            catch (error: IllegalArgumentException) {
+                if (reportErrors) reportConnectError(if (error is com.lumen.core.config.crypto.ProfilePolicyException)
+                    profilePolicyMessage(error) else "Lumen profile restrictions prevent connecting")
+                return@withContext null
+            }
+        }
+        val obfsBridges = obfsBridgesOf(parsedSelected)
+        if (obfsBridges.size > 1) {
+            if (reportErrors) {
+                reportConnectError(
+                    "Config build failed: AUTO contains multiple OpenVPN obfs bridges; " +
+                        "select one OpenVPN server"
+                )
+            }
+            return@withContext null
+        }
+        val s = _settings.value
+        val configJson = try {
+            // Also repair an existing IR installation whose first download failed.
+            installBundledGeoResources(s.geoResourceSource)
+            run {
+                val pool = listOf(parsedSelected)
+                // Preserve the physical network's vetted endpoint answer in IR;
+                // global DoH may select a different, inaccessible CDN endpoint.
+                val pinnedServers = runCatching {
+                    val resolver = s.dnsDirectServers.lineSequence()
+                        .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" }
+                    if (geoRegionCode(s.geoResourceSource) == "ir") {
+                        // Pin the active endpoint, not the entire subscription. Inactive
+                        // selector members retain the protected core bootstrap pool.
+                        ServerAddressPinner.pinnedAddresses(listOf(parsedSelected.server), resolver, preferSystemDns = true)
+                    } else ServerAddressPinner.pinnedAddressesForPool(
+                        probeHost = parsedSelected.server,
+                        hostnames = pool.map { it.server },
+                        foreignResolver = resolver
+                    )
+                }.getOrDefault(emptyMap())
+                HybridConfigBuilder.buildConfig(
+                    parsedSelected,
+                    SingboxConfigOptions(
+                        tunMode = false,
+                        tunMtu = tunMtuFor(parsedSelected, s.mtu),
+                        pinnedServerIps = pinnedServers,
+                        localSocksPort = s.localSocksPort.coerceIn(1024, 65535),
+                        localHttpPort = if (s.localInboundEnabled) s.localHttpPort.coerceIn(1024, 65535) else 0,
+                        allowLanConnections = s.lanSharingEnabled,
+                        bypassLan = s.lanSharingEnabled,
+                        // Socks5 authorization: with it on, the builder also drops the
+                        // HTTP inbound, which cannot carry these credentials.
+                        socksAuthEnabled = s.socks5AuthEnabled,
+                        socksUsername = s.socks5Username,
+                        socksPassword = s.socks5Password,
+                        // Geo rule sets are loaded from disk. A remote set is fetched
+                        // while the core starts and a failed fetch kills the start.
+                        geoRuleSetDir = geoResourcesDir.absolutePath,
+                        requireLocalRuleSets = true,
+                        multiplexEnabled = s.muxEnabled,
+                        multiplexConcurrency = s.muxConcurrency,
+                        // sniffRouteOnly and the three fragment sub-fields are gone: the
+                        // builder no longer reads them, this core has no counterpart.
+                        enableFinalFragment = s.fragmentEnabled,
+                        preferIpv6 = s.preferIpv6,
+                        blockQuic = s.blockQuic,
+                        proxyDnsServer = s.dnsProxyServers.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { "cloudflare-dns.com" },
+                        directDnsServer = s.dnsDirectServers.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
+                        dnsMode = s.dnsMode,
+                        dnsCustomJson = s.dnsCustomJson,
+                        dnsDirectServers = s.dnsDirectServers.split(Regex("[\\n,;]+")).map(String::trim).filter(String::isNotEmpty),
+                        // Desktop parity: the physical adapter's own resolvers bootstrap
+                        // the DNS chain. Read here, before the tunnel exists, so this is
+                        // the underlay network's list and never the TUN's own address.
+                        systemDnsServers = currentNetworkDnsServers(),
+                        dnsProxyServers = s.dnsProxyServers.split(Regex("[\\n,;]+")).map(String::trim).filter(String::isNotEmpty),
+                        dnsDirectType = s.dnsDirectType,
+                        dnsProxyType = s.dnsProxyType,
+                        dnsDirectStrategy = s.dnsDirectStrategy,
+                        dnsProxyStrategy = s.dnsProxyStrategy,
+                        dnsHijackEnabled = s.dnsHijackEnabled,
+                        dnsFakeIpEnabled = s.dnsFakeIpEnabled,
+                        dnsParallelQuery = s.dnsParallelQuery,
+                        dnsOptimisticCache = s.dnsOptimisticCache,
+                        dnsGeoCheck = s.dnsGeoCheck,
+                        dnsProxyIpv4Only = s.dnsProxyIpv4Only,
+                        dnsHosts = s.dnsHosts.lineSequence().mapNotNull { line ->
+                            val host = line.substringBefore('=').trim().trimEnd('.').lowercase()
+                            val addresses = line.substringAfter('=', "").split(',').map(String::trim).filter(String::isNotEmpty)
+                            if (host.isNotBlank() && addresses.isNotEmpty()) host to addresses else null
+                        }.toMap(),
+                        dnsOverrideEnabled = s.dnsOverrideEnabled,
+                        dnsOverrideHostname = s.dnsOverrideHostname,
+                        dnsOverrideIpv4 = s.dnsOverrideIpv4,
+                        // Core verbosity follows the master switch. "none" is not a
+                        // valid level for this core, so silence is "error" - the level
+                        // the core itself only uses for a fatal it is about to die on.
+                        logLevel = if (s.loggingEnabled) CORE_LOG_LEVEL else "error",
+                        urlTestUrl = s.urlTestUrl.ifBlank { "https://www.gstatic.com/generate_204" },
+                        urlTestIntervalMinutes = s.urlTestIntervalMinutes.coerceIn(1, 1440),
+                        urlTestToleranceMs = s.urlTestToleranceMs.coerceIn(0, 5000),
+                        geoResourceSource = s.geoResourceSource,
+                        routingFinalOutbound = s.routingFinalOutbound,
+                        directDomains = (s.directDomains + "\n" + s.directIpCidrs)
+                            .split(Regex("[\\n,;]+"))
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() },
+                        directIpCidrs = emptyList(),
+                        // Remote .srs sets and urltest selections must survive a
+                        // reconnect. Without this, every start re-downloads GitHub
+                        // resources and a temporary 404/network block aborts the core.
+                        cacheFileEnabled = true,
+                        cacheFilePath = File(context.filesDir, "singbox/cache.db").also {
+                            it.parentFile?.mkdirs()
+                        }.absolutePath,
+                        // Core knobs the builder gained that SettingsUiState has no row for
+                        // yet. They come from the same preference store the settings screens
+                        // use, so adding a row later is a one-line change; every default
+                        // below matches SingboxConfigOptions, so today's output is unchanged.
+                        multiplexProtocol = prefs.getString("mux_protocol", "smux") ?: "smux",
+                        multiplexMinStreams = prefs.getInt("mux_min_streams", 4),
+                        multiplexPadding = prefs.getBoolean("mux_padding", true),
+                        multiplexBrutalEnabled = prefs.getBoolean("mux_brutal_enabled", false),
+                        multiplexBrutalUpMbps = prefs.getInt("mux_brutal_up_mbps", 0),
+                        multiplexBrutalDownMbps = prefs.getInt("mux_brutal_down_mbps", 0),
+                        outboundTcpFastOpen = prefs.getBoolean("outbound_tcp_fast_open", false),
+                        outboundTcpMultiPath = prefs.getBoolean("outbound_tcp_multi_path", false),
+                        outboundUdpFragment = prefs.getBoolean("outbound_udp_fragment", false),
+                        outboundConnectTimeoutSeconds = prefs.getInt("outbound_connect_timeout_s", 0),
+                        udpOverTcp = prefs.getBoolean("udp_over_tcp", false),
+                        dnsFakeIpRangeIPv4 = prefs.getString("dns_fake_ip_range_v4", null)
+                            ?.takeIf { it.isNotBlank() } ?: "198.18.0.0/15",
+                        dnsFakeIpRangeIPv6 = prefs.getString("dns_fake_ip_range_v6", null)
+                            ?.takeIf { it.isNotBlank() } ?: "fc00::/18",
+                        dnsIndependentCache = prefs.getBoolean("dns_independent_cache", true),
+                        dnsDisableCache = prefs.getBoolean("dns_disable_cache", false),
+                        dnsClientSubnet = prefs.getString("dns_client_subnet", "").orEmpty().trim(),
+                        domainResolverStrategy = prefs.getString("domain_resolver_strategy", "")
+                            .orEmpty().trim().lowercase(Locale.US),
+                        sniffTimeoutMs = prefs.getInt("sniff_timeout_ms", 0),
+                        // String backed like directDomains, so the same separators apply.
+                        sniffers = prefs.getString("sniffers", "").orEmpty()
+                            .split(Regex("[\\n,;]+"))
+                            .map { it.trim().lowercase(Locale.US) }
+                            .filter { it.isNotEmpty() },
+                        urlTestIdleTimeoutMinutes = prefs.getInt("url_test_idle_timeout_minutes", 0),
+                        urlTestInterruptExistConnections =
+                            prefs.getBoolean("url_test_interrupt_exist", true)
+                    ), CoreMode.of(s.engine), { availableTcpPort(setOf(s.localSocksPort, s.localHttpPort)) }
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            if (parsedSelected.scheme == "openvpn" && e.message?.startsWith("Could not decrypt OpenVPN private key") == true) {
+                sessionOpenVpnSecrets.computeIfPresent(selected.id) { _, secret -> secret.copy(keyPassword = "") }
+                if (reportErrors) _openVpnCredentialRequest.value = OpenVpnCredentialRequest(selected.id, selected.name,
+                    com.lumen.core.config.parser.OpenVpnMissingCredentials(false, false, true))
+                return@withContext null
+            }
+            if (reportErrors) reportConnectError(if (selected.link.startsWith(ProtectedProfileCodec.PREFIX))
+                "Protected profile configuration is unsupported" else "Config build failed: ${e.message}")
+            return@withContext null
+        }
+        // OpenVPN "Use proxy" with obfs2/obfs3 needs the in-app transport relay;
+        // plain http/socks proxies are handled by the core itself.
+        val bridge = obfsBridges.singleOrNull()
+        // One shared builder for the app, the widget and the tile: the two latter
+        // read these prefs back, so every start parameter must be mirrored here.
+        val params = VpnStartParams(
+            configJson = if (selected.link.startsWith(ProtectedProfileCodec.PREFIX)) JSONObject(configJson)
+                .put("_lumen_protected", true).apply {
+                    parsedSelected.profilePolicy?.takeIf { it.restricted }?.let { policy ->
+                        put(com.lumen.core.vpn.ProfilePolicyEnforcer.CONFIG_KEY, policy.toJson()
+                            .put("storeHash", selected.link.removePrefix(ProtectedProfileCodec.PREFIX + "store/").substringBefore('/')))
+                    }
+                }.toString() else withSstpSidecar(parsedSelected, configJson),
+            engineType = "SINGBOX",
+            splitMode = _splitMode.value.name,
+            splitPackages = _splitPackages.value,
+            // The tun device itself must respect the same OpenVPN ceiling as the config.
+            mtu = tunMtuFor(parsedSelected, s.mtu),
+            localSocksPort = s.localSocksPort,
+            proxyOnly = s.proxyOnly,
+            dnsMode = s.dnsMode,
+            reconnectOnNetworkChange = s.reconnectOnNetworkChange,
+            obfsType = bridge?.first.orEmpty(),
+            obfsHost = bridge?.second.orEmpty(),
+            obfsPort = bridge?.third ?: 0
+        )
+        // Writes the config to its own private file; the start intent only carries the
+        // path, which is what keeps a 300 member AUTO pool out of the Binder transaction.
+        currentCoroutineContext().ensureActive()
+        val stored = storedVpnConfigWriteMutex.withLock {
+            // A foreground connect cancels any stale background build before waiting
+            // for this lock, so it is always the last writer of active-config.json.
+            currentCoroutineContext().ensureActive()
+            runCatching { VpnStartIntentFactory.persistStartParams(context, params) }
+        }
+        if (stored.isFailure) {
+            if (reportErrors) {
+                reportConnectError(
+                    "Could not store the generated config: ${stored.exceptionOrNull()?.message}"
+                )
+            }
+            return@withContext null
+        }
+        if (reportErrors) {
+            VpnLogBus.clearLastError()
+            log("Starting sing-box extended \u2192 ${selected.name}")
+        }
+        VpnStartIntentFactory.buildStartIntent(context, params)
+    }
+
+    /** Returns every distinct obfs bridge used by a node or an imported AUTO pool. */
+    private fun obfsBridgesOf(node: ParsedNode): List<Triple<String, String, Int>> {
+        val candidates = if (node.scheme.equals("auto", true)) {
+            LinkParser.autoMembers(node.outbound)
+        } else {
+            listOf(node)
+        }
+        return candidates.mapNotNull(::obfsBridgeOf).distinct()
+    }
+
+    private fun obfsBridgeOf(node: ParsedNode): Triple<String, String, Int>? {
+        val proxy = node.outbound["lumen_proxy"] as? Map<*, *> ?: return null
+        val type = (proxy["type"] as? String)?.trim()?.lowercase().orEmpty()
+        if (type !in setOf("obfs2", "obfs2-legacy", "obfs3")) return null
+        val host = (proxy["server"] as? String)?.trim().orEmpty()
+        val port = when (val raw = proxy["server_port"]) {
+            is Number -> raw.toInt()
+            is String -> raw.trim().toIntOrNull() ?: 0
+            else -> 0
+        }
+        if (host.isBlank() || port !in 1..65535) return null
+        return Triple(type, host, port)
+    }
+
+    /**
+     * Largest local TUN MTU that still fits inside one OpenVPN datagram on an
+     * ordinary 1500-byte path: 1500 minus IP, UDP/TCP, the OpenVPN header and the
+     * data-channel HMAC/GCM tag leaves roughly 1400 usable bytes.
+     */
+    private val openVpnMaxTunMtu = 1400
+
+    /** True when this node, or any member of an imported AUTO pool, is OpenVPN. */
+    private fun usesOpenVpn(node: ParsedNode): Boolean {
+        val candidates = if (node.scheme.equals("auto", true)) {
+            LinkParser.autoMembers(node.outbound)
+        } else {
+            listOf(node)
+        }
+        return candidates.any { member ->
+            member.scheme.equals("openvpn", true) ||
+                (member.outbound["type"] as? String)?.let {
+                    it.equals("openvpn", true) || it.equals("openvpn-client", true)
+                } == true
+        }
+    }
+
+    /**
+     * The MTU setting goes up to 9000, which is fine for the TCP-based protocols but
+     * hands OpenVPN packets it cannot carry: everything the far side has to fragment
+     * or drop stalls, which is why small requests survive while QUIC and other
+     * full-size traffic (Google, YouTube) hangs on an otherwise connected tunnel.
+     */
+    private fun tunMtuFor(node: ParsedNode, requested: Int): Int {
+        val bounded = requested.coerceIn(1280, 9000)
+        return if (usesOpenVpn(node)) bounded.coerceAtMost(openVpnMaxTunMtu) else bounded
+    }
+
+    fun buildStopIntent(context: Context): Intent =
+        VpnStartIntentFactory.buildStopIntent(context)
+
+    private fun profilePolicyMessage(error: com.lumen.core.config.crypto.ProfilePolicyException): String =
+        when (error.reason) {
+            com.lumen.core.config.crypto.ProfilePolicyDenial.EXPIRED -> com.lumen.ui.screens.LumenProfileText.EXPIRED
+            com.lumen.core.config.crypto.ProfilePolicyDenial.CLOCK -> com.lumen.ui.screens.LumenProfileText.CLOCK
+            com.lumen.core.config.crypto.ProfilePolicyDenial.WIFI -> com.lumen.ui.screens.LumenProfileText.WIFI_REQUIRED
+            com.lumen.core.config.crypto.ProfilePolicyDenial.UNMETERED -> com.lumen.ui.screens.LumenProfileText.UNMETERED_REQUIRED
+        }.inLanguage(_settings.value.language)
+
+    /**
+     * SSTP nodes need the relay and bridge described to the VPN service. The key rides in
+     * the config JSON like `_lumen_xray`, so widgets and tiles start the same way.
+     */
+    private fun withSstpSidecar(parsed: ParsedNode, configJson: String): String {
+        if (!parsed.scheme.equals("sstp", ignoreCase = true)) return configJson
+        val params = com.lumen.core.config.parser.SstpLink.parse(parsed.link) ?: return configJson
+        // Fresh loopback ports for every start: the bridge never shares a fixed port with the
+        // user's local inbound or another app. The sing-box socks outbound is pointed at the same port.
+        val root = org.json.JSONObject(configJson)
+        val relayPort = freeLoopbackPort()
+        val candidateSocks = freeLoopbackPort().takeIf { it != relayPort } ?: freeLoopbackPort()
+        val rewired = repointSstpOutbound(root, candidateSocks)
+        val socksPort = if (rewired > 0) candidateSocks else com.lumen.core.config.parser.SstpLink.SOCKS_PORT
+        return root.put("_lumen_sstp", org.json.JSONObject()
+            .put("host", params.host)
+            .put("port", params.port)
+            .put("username", params.username)
+            .put("password", params.password)
+            .put("relay_port", relayPort)
+            .put("socks_port", socksPort)).toString()
+    }
+
+    private fun freeLoopbackPort(): Int =
+        java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1")).use { it.localPort }
+
+    /** Rewrites loopback socks endpoints that point at the SSTP default port. Returns how many changed. */
+    private fun repointSstpOutbound(node: Any?, port: Int): Int {
+        val defaultPort = com.lumen.core.config.parser.SstpLink.SOCKS_PORT
+        return when (node) {
+            is org.json.JSONObject -> {
+                var count = 0
+                val host = node.optString("server", node.optString("address"))
+                if (host == "127.0.0.1") {
+                    for (key in listOf("server_port", "port")) {
+                        if (node.has(key) && node.optInt(key, -1) == defaultPort) {
+                            node.put(key, port)
+                            count++
+                        }
+                    }
+                }
+                node.keys().forEach { key -> count += repointSstpOutbound(node.opt(key), port) }
+                count
+            }
+            is org.json.JSONArray -> (0 until node.length()).sumOf { repointSstpOutbound(node.opt(it), port) }
+            else -> 0
+        }
+    }
+
+    private fun parseEntity(entity: NodeEntity): ParsedNode {
+        val parsed = parseStoredEntity(entity)
+        return sessionOpenVpnSecrets[entity.id]?.takeIf { parsed.scheme == "openvpn" }
+            ?.let { com.lumen.core.config.parser.OpenVpnCredentials.apply(parsed, it) } ?: parsed
+    }
+
+    private fun parseStoredEntity(entity: NodeEntity): ParsedNode {
+        if (entity.link.startsWith(ProtectedProfileCodec.PREFIX)) return ProtectedProfiles.resolve(entity.link, getApplication())
+        try {
+            if (entity.isAutoNode || entity.protocol.equals("auto", true) || entity.link.trim().equals("auto", true)) {
+                // An imported AUTO group stores its server pool in outboundJson.
+                val storedAuto = entity.outboundJson.trim()
+                val autoOutbound = if (storedAuto.startsWith("{")) {
+                    runCatching { LinkParser.jsonToMap(JSONObject(storedAuto)) }.getOrDefault(emptyMap())
+                } else emptyMap()
+                return ParsedNode(
+                    name = entity.name,
+                    scheme = "auto",
+                    server = "",
+                    port = 0,
+                    link = entity.link,
+                    outbound = autoOutbound
+                )
+            }
+
+            var parsed: ParsedNode? = null
+
+            val linkText = entity.link.trim()
+
+            // The stored normalized outbound is authoritative for every protocol.
+            // Re-parsing a share link drops Clash-only fields, native sing-box
+            // dependencies, plugins and protocol options that have no URI spelling.
+            val storedJson = entity.outboundJson.trim()
+            if (storedJson.startsWith("{")) {
+                try {
+                    val json = JSONObject(storedJson)
+                    val outboundMap = LinkParser.jsonToMap(json)
+                    val isNormalizedWrapper = outboundMap.keys.any {
+                        it in setOf(
+                            "protocol", "singbox", "settings", "streamSettings",
+                            "clash", "_singbox_dependencies"
+                        )
+                    }
+                    parsed = if (json.optString("protocol").equals("xray_config", ignoreCase = true)) {
+                        // Older Android builds stored the desktop envelope as
+                        // an outbound. Recover its real protocol before routing.
+                        LinkParser.parseJsonObjectOutbound(json).let {
+                            it.copy(name = entity.name.ifBlank { it.name })
+                        }
+                    } else if (isNormalizedWrapper) {
+                        ParsedNode(
+                            name = entity.name.ifBlank { entity.server },
+                            scheme = entity.protocol,
+                            server = entity.server,
+                            port = entity.port,
+                            link = entity.link,
+                            outbound = outboundMap
+                        )
+                    } else {
+                        LinkParser.parseJsonObjectOutbound(json)
+                    }
+                } catch (_: Exception) {}
+            }
+
+            if (parsed == null && linkText.isNotBlank() && !linkText.startsWith("{") && !linkText.startsWith("[")) {
+                try {
+                    val (nodes, _) = LinkParser.parseLinksText(linkText)
+                    parsed = nodes.firstOrNull()
+                } catch (_: Exception) {}
+            }
+
+            if (parsed == null) {
+                val jsonCandidate = when {
+                    linkText.startsWith("{") -> linkText
+                    else -> ""
+                }
+                if (jsonCandidate.isNotEmpty()) {
+                    try {
+                        val json = JSONObject(jsonCandidate)
+                        parsed = LinkParser.parseJsonObjectOutbound(json)
+                    } catch (_: Exception) {}
+                }
+            }
+
+            if (parsed == null) {
+                var outboundMap: Map<String, Any?> = emptyMap()
+                if (entity.outboundJson.trim().startsWith("{")) {
+                    try {
+                        outboundMap = LinkParser.jsonToMap(JSONObject(entity.outboundJson.trim()))
+                    } catch (_: Exception) {}
+                }
+                parsed = ParsedNode(
+                    name = entity.name.ifBlank { entity.server },
+                    scheme = entity.protocol.ifBlank { "unknown" },
+                    server = entity.server,
+                    port = entity.port,
+                    link = entity.link,
+                    outbound = outboundMap
+                )
+            }
+
+            if (parsed.name.isBlank()) parsed.name = entity.name
+            if (parsed.server.isBlank()) parsed.server = entity.server
+            if (parsed.port <= 0) parsed.port = entity.port
+
+            return com.lumen.core.config.parser.ShareLinkExtensions.restore(parsed)
+        } catch (e: Exception) {
+            log("Parse error for ${entity.name}: ${e.message}")
+            return ParsedNode(
+                name = entity.name.ifBlank { "Node" },
+                scheme = entity.protocol.ifBlank { "unknown" },
+                server = entity.server,
+                port = entity.port,
+                link = entity.link,
+                outbound = emptyMap()
+            )
+        }
+    }
+
+    private fun extractDisplayProtocol(rawProtocol: String, outboundJson: String?, link: String?): String {
+        val outboundObject = outboundJson?.takeIf { it.isNotBlank() }?.let { json ->
+            runCatching { JSONObject(json) }.getOrNull()
+        }
+        val preferred = outboundObject?.optString("display_protocol").orEmpty().trim()
+        if (preferred.isNotEmpty()) return preferred
+
+        val jsonUpper = outboundJson?.uppercase() ?: ""
+        val linkUpper = link?.uppercase() ?: ""
+        val rootWarp = outboundObject?.optBoolean("warp", false) == true
+        val isAutoPool = rawProtocol.equals("auto", ignoreCase = true)
+
+        val isWarp = rootWarp || rawProtocol.equals("warp", ignoreCase = true) ||
+            (!isAutoPool && (
+                jsonUpper.contains("\"TYPE\":\"WARP\"") ||
+                    jsonUpper.contains("\"TYPE\": \"WARP\"") ||
+                    jsonUpper.contains("\"WARP\":TRUE") ||
+                    jsonUpper.contains("\"WARP\": TRUE") ||
+                    jsonUpper.contains("CLOUDFLARECLIENT.COM") ||
+                    jsonUpper.contains("162.159.192.") ||
+                    jsonUpper.contains("162.159.193.") ||
+                    jsonUpper.contains("162.159.198.") ||
+                    jsonUpper.contains("188.114.") ||
+                    jsonUpper.contains("2606:4700:110:") ||
+                    jsonUpper.contains("2606:4700:D0:") ||
+                    jsonUpper.contains("2606:4700:D1:") ||
+                    linkUpper.startsWith("WARP://") ||
+                    linkUpper.contains("CLOUDFLARECLIENT.COM")
+                ))
+        if (isWarp) {
+            val isMasque = rawProtocol.equals("masque", ignoreCase = true) ||
+                jsonUpper.contains("\"TYPE\":\"MASQUE\"") ||
+                jsonUpper.contains("\"TYPE\": \"MASQUE\"") ||
+                linkUpper.startsWith("MASQUE://")
+            return if (isMasque) "MASQUE/WARP" else "AWG/WARP"
+        }
+
+        val isAwg = rawProtocol.equals("awg", ignoreCase = true) ||
+                rawProtocol.equals("amneziawg", ignoreCase = true) ||
+                jsonUpper.contains("\"AMNEZIA\"") ||
+                jsonUpper.contains("\"JC\"") ||
+                jsonUpper.contains("\"JMIN\"") ||
+                jsonUpper.contains("\"H1\"") ||
+                jsonUpper.contains("\"S1\"") ||
+                linkUpper.contains("AWG://") ||
+                linkUpper.contains("AMNEZIA-WG") ||
+                linkUpper.contains("JC=") ||
+                linkUpper.contains("H1=") ||
+                linkUpper.contains("S1=")
+
+        val proto = when {
+            isAwg -> "AWG"
+            rawProtocol.equals("wireguard", ignoreCase = true) || rawProtocol.equals("wg", ignoreCase = true) -> "WireGuard"
+            rawProtocol.equals("openvpn", ignoreCase = true) -> "OpenVPN"
+            rawProtocol.equals("hysteria2", ignoreCase = true) || rawProtocol.equals("hy2", ignoreCase = true) -> "Hysteria2"
+            rawProtocol.equals("tuic", ignoreCase = true) -> "TUIC"
+            rawProtocol.equals("shadowsocks", ignoreCase = true) || rawProtocol.equals("ss", ignoreCase = true) -> "Shadowsocks"
+            else -> rawProtocol.trim().uppercase()
+        }
+
+        if (proto == "AWG" || proto == "WireGuard" || proto == "OpenVPN" || proto == "Hysteria2" || proto == "TUIC" || proto == "Shadowsocks") {
+            return proto
+        }
+
+        val security = when {
+            jsonUpper.contains("\"REALITY\"") || linkUpper.contains("SECURITY=REALITY") || linkUpper.contains("PBK=") -> "REALITY"
+            jsonUpper.contains("\"TLS\"") || linkUpper.contains("SECURITY=TLS") -> "TLS"
+            else -> ""
+        }
+
+        val network = when {
+            jsonUpper.contains("\"XHTTP\"") || linkUpper.contains("TYPE=XHTTP") || linkUpper.contains("HEADER=XHTTP") -> "XHTTP"
+            jsonUpper.contains("\"HTTPUPGRADE\"") || linkUpper.contains("TYPE=HTTPUPGRADE") -> "HTTPUpgrade"
+            jsonUpper.contains("\"GRPC\"") || linkUpper.contains("TYPE=GRPC") -> "gRPC"
+            jsonUpper.contains("\"WS\"") || linkUpper.contains("TYPE=WS") -> "WS"
+            jsonUpper.contains("\"H2\"") || linkUpper.contains("TYPE=H2") -> "H2"
+            else -> ""
+        }
+
+        val subType = when {
+            security == "REALITY" -> "REALITY"
+            network.isNotEmpty() && security.isNotEmpty() -> "$security/$network"
+            network.isNotEmpty() -> network
+            security.isNotEmpty() -> security
+            else -> ""
+        }
+
+        return if (subType.isNotEmpty()) "$proto/$subType" else proto
+    }
+
+    // AWG/WireGuard imports have no human readable name, so the parser generates one from
+    // the endpoint ("AmneziaWG-1.2.3.4"). Those are recognised here and replaced with the
+    // detected location, so the list and the connection status area show "Germany" for AWG
+    // exactly like they already do for VLESS.
+    private val technicalNodeNameRegex = Regex(
+        "^(amnezia\\s*-?wg|amneziawg|awg|wireguard|wg)\\b[-_ :]*",
+        RegexOption.IGNORE_CASE
+    )
+
+    private fun locationNameOrNull(name: String, server: String, countryCode: String): String? {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return null
+        val technical = technicalNodeNameRegex.containsMatchIn(trimmed) ||
+            trimmed.equals(server, ignoreCase = true) ||
+            trimmed.removePrefix("[").removeSuffix("]").equals(server, ignoreCase = true)
+        if (!technical) return null
+        val location = runCatching {
+            CountryFlagHelper.countryDisplayName(countryCode)
+        }.getOrDefault("")
+        return location.ifBlank { null }
+    }
+
+    private fun shouldResolveWireGuardCountry(entity: NodeEntity): Boolean {
+        val protocol = entity.protocol.trim().lowercase(Locale.US)
+        if (protocol !in setOf("awg", "amneziawg", "wireguard", "wg")) return false
+        if (CountryFlagHelper.detectCountryStrict(entity.name, entity.server).isNotEmpty()) return false
+        return !isWarpNode(entity)
+    }
+
+    private fun isWarpNode(entity: NodeEntity): Boolean {
+        val outbound = entity.outboundJson.orEmpty()
+        return runCatching { JSONObject(outbound).optBoolean("warp", false) }.getOrDefault(false) ||
+            entity.name.contains("warp", true) ||
+            outbound.contains("cloudflare", true) ||
+            outbound.contains("2606:4700:110:", true)
+    }
+
+    private fun normalizedEndpointHost(server: String): String =
+        server.trim().removePrefix("[").removeSuffix("]").substringBefore('%').lowercase(Locale.US)
+
+    private fun normalizedEndpointKey(server: String, port: Int): String =
+        "${normalizedEndpointHost(server)}:$port"
+
+    private fun resolveCountryCode(host: String): String {
+        val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: return ""
+        if (
+            address.isAnyLocalAddress ||
+            address.isLoopbackAddress ||
+            address.isLinkLocalAddress ||
+            address.isSiteLocalAddress ||
+            address.isMulticastAddress
+        ) return ""
+        val queryAddress = address.hostAddress?.substringBefore('%').orEmpty()
+        if (queryAddress.isEmpty()) return ""
+        return runCatching {
+            val connection = (URL("https://ipwho.is/$queryAddress").openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 3_000
+                readTimeout = 3_000
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "Lumen-Android")
+            }
+            try {
+                if (connection.responseCode !in 200..299) return@runCatching ""
+                val json = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+                if (!json.optBoolean("success", true)) return@runCatching ""
+                json.optString("country_code")
+                    .trim()
+                    .uppercase(Locale.US)
+                    .takeIf { it.length == 2 && it.all { ch -> ch in 'A'..'Z' } }
+                    .orEmpty()
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrDefault("")
+    }
+
+    private fun stripFlagEmoji(value: String): String {
+        val result = StringBuilder()
+        value.codePoints().forEach { codePoint ->
+            if (codePoint !in 0x1F1E6..0x1F1FF && codePoint != 0xFE0F) {
+                result.appendCodePoint(codePoint)
+            }
+        }
+        return result.toString()
+            .replace(Regex("^[\\s|•·:—–-]+|[\\s|•·:—–-]+$"), "")
+            .replace(Regex("\\s{2,}"), " ")
+            .trim()
+    }
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            val context = getApplication<Application>()
+            val changes = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+            val policyPrefs = context.getSharedPreferences(
+                com.lumen.core.vpn.ProfilePolicyEnforcer.PREFS_NAME, Context.MODE_PRIVATE)
+            val listener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == null || key.startsWith("expiry_")) changes.trySend(Unit)
+            }
+            policyPrefs.registerOnSharedPreferenceChangeListener(listener)
+            try {
+                while (isActive) {
+                    var failed = false
+                    try {
+                        val expired = ProtectedProfiles.expiredHashes(context)
+                        if (expired.isNotEmpty()) {
+                            val prefix = ProtectedProfileCodec.PREFIX + "store/"
+                            val removed = nodeDao.getNodes().first().filter { entity ->
+                                !entity.favorite && entity.link.startsWith(prefix) && entity.link.removePrefix(prefix).substringBefore('/') in expired
+                            }
+                            db.withTransaction { removed.forEach { nodeDao.deleteNodeById(it.id) } }
+                            removed.forEach { sessionOpenVpnSecrets.remove(it.id) }
+                            if (removed.any { it.id == _selectedNodeId.value }) {
+                                storedVpnConfigWriteMutex.withLock { com.lumen.core.vpn.VpnConfigStore.clear(context) }
+                            }
+                            ProtectedProfiles.deleteExpiredFiles(context, expired)
+                        }
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) { failed = true }
+                    // Imports/removals wake this immediately. With no expiry indexed,
+                    // suspend indefinitely instead of waking the app every five seconds.
+                    val nextCheck = if (failed) 30_000L else ProtectedProfiles.nextExpiryDelayMs(context)
+                    if (nextCheck == null) changes.receive()
+                    else withTimeoutOrNull(nextCheck) { changes.receive() }
+                }
+            } finally {
+                policyPrefs.unregisterOnSharedPreferenceChangeListener(listener)
+                changes.close()
+            }
+        }
+    }
+
+    companion object {
+        const val PREFS_NAME = "lumen_prefs"
+
+        /**
+         * Launcher icon the user pinned. Read before [_settings] exists (startup
+         * reconcile) and written by [updateSettings], hence a named constant.
+         */
+        const val PREF_LAUNCHER_ICON = "launcher_icon"
+        /** Preference ServerListScreen and the dashboard read their group from. */
+        const val KEY_SERVERS_LAST_GROUP = "servers_last_group"
+        /** Must match ServerListScreen's GROUP_MANUAL: the default / manual bucket. */
+        const val SERVER_GROUP_MANUAL = "manual"
+        // Core verbosity while logging is on. Debug is the single biggest CPU and
+        // battery drain here — every line crosses the log bus — so stay at warning.
+        const val CORE_LOG_LEVEL = "warning"
+        private const val STORED_CONFIG_REFRESH_DEBOUNCE_MS = 400L
+        private const val STORED_CONFIG_RUNNING_RETRY_MS = 250L
+        private const val GEO_RESOURCE_MAX_BYTES = 256L * 1024 * 1024
+        private const val PREF_LAST_ANDROID_UPDATE_CHECK = "last_android_update_check_ms"
+        private const val PREF_LATEST_ANDROID_UPDATE_TAG = "latest_android_update_tag"
+        private const val PREF_LATEST_ANDROID_UPDATE_VERSION = "latest_android_update_version"
+        private const val PREF_LATEST_ANDROID_UPDATE_RELEASE_URL = "latest_android_update_release_url"
+        private const val PREF_LATEST_ANDROID_UPDATE_APK_NAME = "latest_android_update_apk_name"
+        private const val PREF_LATEST_ANDROID_UPDATE_APK_URL = "latest_android_update_apk_url"
+        /** Last known subscription-userinfo figures, one `id|upload|download|total|expire` line each. */
+        private const val KEY_SUBSCRIPTION_USAGE = "subscription_usage"
+        private val USAGE_KEYS = listOf("upload", "download", "total", "expire")
+        /** Ping methods that start a temporary core for the node instead of probing its endpoint. */
+        private val CORE_PING_TYPES = setOf("http")
+        /** Plain nodes probed per temporary core in HTTP mode (one core start instead of one per node). */
+        private const val PING_BATCH_SIZE = 8
+        private val NON_PROXY_OUTBOUND_TYPES = setOf("direct", "block", "dns", "selector", "urltest")
+        /** Protocols whose endpoint only listens on UDP, so a TCP connect can never succeed. */
+        private val UDP_ONLY_SCHEMES = setOf(
+            "wireguard", "amneziawg", "awg", "wg", "warp",
+            // Hysteria/Hysteria2 and TUIC listen on QUIC/UDP. TCPing their port
+            // measures a service that does not exist, so use the actual outbound
+            // and HTTP relay-delay check instead.
+            "hysteria", "hysteria2", "hy", "hy2", "tuic",
+            // OpenVPN profiles are commonly UDP and the database protocol does not
+            // carry the parsed transport. A real through-core check is valid for both
+            // UDP and TCP profiles and proves that the tunnel passes traffic.
+            "openvpn", "ovpn"
+        )
+    }
+}
+
+/** Longest provider text kept per field; the spec caps announcements at 200 characters. */
+private const val SUBSCRIPTION_TEXT_MAX = 400
+
+/**
+ * Folds one refresh's headers into the stored provider metadata.
+ *
+ * Same rule the traffic figures already follow: a field this response did not carry keeps
+ * the value the panel sent last time. A refresh that answers through a fallback
+ * User-Agent, or that simply drops `announce`, must not blank the card.
+ */
+internal fun mergeSubscriptionMetadata(
+    stored: SubscriptionEntity,
+    fresh: SubscriptionMetadata,
+    intervalHours: Int?
+): SubscriptionEntity = stored.copy(
+    description = fresh.description?.take(SUBSCRIPTION_TEXT_MAX) ?: stored.description,
+    announce = fresh.announce?.take(SUBSCRIPTION_TEXT_MAX) ?: stored.announce,
+    announceUrl = fresh.announceUrl ?: stored.announceUrl,
+    telegramUrl = fresh.telegramUrl ?: stored.telegramUrl,
+    supportUrl = fresh.supportUrl ?: stored.supportUrl,
+    supportEmail = fresh.supportEmail ?: stored.supportEmail,
+    websiteUrl = fresh.websiteUrl ?: stored.websiteUrl,
+    premiumUrl = fresh.premiumUrl ?: stored.premiumUrl,
+    bannerText = fresh.bannerText?.take(SUBSCRIPTION_TEXT_MAX) ?: stored.bannerText,
+    bannerButtonText = fresh.bannerButtonText?.take(80) ?: stored.bannerButtonText,
+    bannerButtonUrl = fresh.bannerButtonUrl ?: stored.bannerButtonUrl,
+    bannerBgColor = fresh.bannerBgColor ?: stored.bannerBgColor,
+    bannerButtonColor = fresh.bannerButtonColor ?: stored.bannerButtonColor,
+    hideUrl = fresh.hideUrl ?: stored.hideUrl,
+    sortOrder = fresh.sortOrder ?: stored.sortOrder,
+    updateIntervalHours = intervalHours ?: stored.updateIntervalHours
+)
+
+/**
+ * Accounting for the `subscription-userinfo` figures. Pure, and kept out of the view
+ * model so the rules that used to be wrong here — a zero `total` meaning "unlimited"
+ * rather than "nothing left", upload counting towards the quota, an expiry that is
+ * absent rather than elapsed — are covered by unit tests.
+ */
+internal object SubscriptionUsage {
+    /** 9999-12-31T23:59:59Z, the same ceiling SubscriptionClient normalises expiry to. */
+    private const val MAX_EXPIRE_SECONDS = 253_402_300_799L
+    private const val DAY_MS = 86_400_000L
+
+    /**
+     * Folds one refresh into the stored figures. Only the keys the panel actually sent
+     * are replaced: a response that omits a field, or a fallback User-Agent whose answer
+     * carries no `subscription-userinfo` header at all, must not reset a known good
+     * value to zero.
+     */
+    fun merge(stored: Map<String, Long>, fresh: Map<String, Long>): Map<String, Long> =
+        if (fresh.isEmpty()) stored else stored + fresh
+
+    /** Both directions count against the quota, which is what the panels themselves report. */
+    fun used(info: Map<String, Long>): Long =
+        (info["upload"] ?: 0L).coerceAtLeast(0L) + (info["download"] ?: 0L).coerceAtLeast(0L)
+
+    /** null = unlimited: a missing or zero `total` is how panels spell an uncapped plan. */
+    fun totalOrUnlimited(info: Map<String, Long>): Long? = info["total"]?.takeIf { it > 0L }
+
+    fun remaining(info: Map<String, Long>): Long? =
+        totalOrUnlimited(info)?.let { (it - used(info)).coerceAtLeast(0L) }
+
+    fun ratio(info: Map<String, Long>): Float? =
+        totalOrUnlimited(info)?.let { (used(info).toDouble() / it).coerceIn(0.0, 1.0).toFloat() }
+
+    /** null = never expires; the value is a UNIX timestamp in seconds. */
+    fun expiryEpochSeconds(info: Map<String, Long>): Long? = info["expire"]?.takeIf { it > 0L }
+
+    /** Rounded up, so a plan with 18 hours left reads "1 day" instead of "0 days". */
+    fun daysLeft(expireEpochSec: Long, nowMs: Long): Int {
+        val remainingMs = expireEpochSec.coerceIn(0L, MAX_EXPIRE_SECONDS) * 1000L - nowMs
+        if (remainingMs <= 0L) return 0
+        return ((remainingMs + DAY_MS - 1) / DAY_MS).toInt()
+    }
+
+    fun summary(info: Map<String, Long>): String {
+        val total = totalOrUnlimited(info)
+        return "${formatBytes(used(info))} / ${total?.let(::formatBytes) ?: "∞"}"
+    }
+
+    fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var value = bytes.toDouble()
+        var index = -1
+        while (value >= 1024 && index < units.lastIndex) {
+            value /= 1024.0
+            index++
+        }
+        return String.format(Locale.US, "%.1f %s", value, units[index.coerceAtLeast(0)])
+    }
+}
+
+/**
+ * Ping deadlines. Pure arithmetic, kept out of the view model so it can be unit
+ * tested: every value follows from the user's timeout / attempts / retry settings,
+ * so raising the timeout raises the deadline instead of contradicting it.
+ */
+internal object PingBudget {
+    fun setupMs(timeoutMs: Int, iranNetwork: Boolean = false): Int =
+        timeoutMs.coerceIn(500, 20_000).coerceAtLeast(if (iranNetwork) 10_000 else 5_000)
+    /** Members of one AUTO pool probed at a time; mirrors autoMemberPingSemaphore. */
+    const val AUTO_MEMBER_CONCURRENCY = 32
+
+    /** Mirrors realPingSemaphore; used by bulk scheduling to avoid timeout in its queue. */
+    const val CORE_PING_CONCURRENCY = 16
+
+    /** Nothing may hold a single row in "measuring" longer than this. */
+    const val MAX_NODE_MS = 180_000L
+
+    /** Nor a whole "ping all" run longer than this. */
+    const val MAX_BATCH_MS = 900_000L
+
+    /**
+     * Every attempt plus the delays between them, with slack for name resolution
+     * and, for the real HTTP check, for starting the temporary core.
+     */
+    fun attemptsMs(timeoutMs: Int, attempts: Int, retryDelayMs: Int, realCheck: Boolean, iranNetwork: Boolean = false): Long {
+        val timeout = timeoutMs.coerceIn(500, 20_000).toLong()
+        val tries = attempts.coerceIn(1, 10).toLong()
+        val retryDelay = retryDelayMs.coerceIn(0, 5_000).toLong()
+        // Core-backed repeats share one temporary process. Each sample includes
+        // setup and response phases, plus fallback exchanges after a failure.
+        // SOCKS connect includes outbound DNS/handshake; HTTPS then has its own
+        // handshake. Default targets have up to three independent exchanges.
+        val probes = tries * if (realCheck) 3L * (2L * setupMs(timeoutMs, iranNetwork) + timeout) else timeout
+        // Address pinning performs at most one 2.5 s UDP DNS query before startup.
+        val startup = if (realCheck) timeout + if (iranNetwork) 5_000L else 3_000L
+            else if (iranNetwork) 5_000L else 0L
+        return startup + probes + (tries - 1) * retryDelay + 2_000L
+    }
+
+    /**
+     * AUTO pools use the effective probe concurrency, including the smaller core
+     * semaphore. Time spent waiting for that semaphore must fit in the deadline.
+     */
+    fun nodeMs(attemptsMs: Long, memberCount: Int, concurrency: Int = AUTO_MEMBER_CONCURRENCY): Long =
+        (attemptsMs * waves(memberCount, concurrency.coerceAtLeast(1))).coerceAtMost(MAX_NODE_MS)
+
+    /** Backstop for a whole run: the per-node ceiling times the number of waves. */
+    fun batchMs(nodeCount: Int, concurrency: Int): Long =
+        (MAX_NODE_MS * waves(nodeCount, concurrency.coerceIn(1, 32)))
+            .coerceIn(MAX_NODE_MS, MAX_BATCH_MS)
+
+    private fun waves(count: Int, perWave: Int): Long {
+        val total = count.coerceAtLeast(1).toLong()
+        return ((total + perWave - 1) / perWave).coerceAtLeast(1L)
+    }
+}
+
+/** Bounded recovery destinations; all requests still traverse the selected proxy. */
+internal fun httpPingTargets(rawUrl: String, iranNetwork: Boolean = false): List<String> {
+    val primary = rawUrl.trim().ifBlank { "https://www.gstatic.com/generate_204" }
+    if (iranNetwork && primary in setOf("https://www.gstatic.com/generate_204", "https://www.google.com/generate_204")) {
+        // Use desktop's destination first, then independent operators. None of
+        // these requests bypasses the tested proxy or contributes handshake time.
+        return listOf("https://www.google.com/generate_204", "https://cp.cloudflare.com/generate_204",
+            "https://www.apple.com/library/test/success.html")
+    }
+    // Only the built-in connectivity destination gets alternatives. An explicit
+    // user URL is a test of that destination, not of an unrelated website.
+    return if (primary == "https://www.gstatic.com/generate_204") listOf(
+        primary,
+        "https://cp.cloudflare.com/generate_204",
+        primary
+    ) else listOf(primary, primary)
+}
+
+/** Any well-formed HTTP response proves that the request traversed the tested proxy. */
+internal fun isSuccessfulHttpPingStatusLine(status: String?): Boolean {
+    val value = status?.trim().orEmpty()
+    val firstSpace = value.indexOf(' ')
+    if (firstSpace <= 0 || !value.substring(0, firstSpace).startsWith("HTTP/", true)) return false
+    val code = value.substring(firstSpace + 1)
+        .trimStart()
+        .takeWhile(Char::isDigit)
+        .takeIf { it.length == 3 }
+        ?.toIntOrNull()
+        ?: return false
+    // 401/403/404 and especially 429 are common for repeated reachability requests.
+    // HTTPS hostname verification already rejects carrier block pages and MITM replies.
+    return code in 100..599
+}
+
+internal data class SubscriptionEdit(val name: String, val url: String)
+
+internal fun refreshedSubscriptionName(
+    currentName: String,
+    providerTitle: String?,
+    adoptProviderTitle: Boolean
+): String = if (adoptProviderTitle) {
+    providerTitle?.trim()?.take(160)?.ifBlank { currentName } ?: currentName
+} else {
+    currentName
+}
+
+/**
+ * HTTPS is always accepted. Plain HTTP follows the App Settings switch, except that an
+ * already saved HTTP URL may be kept while the user changes only the subscription name.
+ */
+internal fun validateSubscriptionEdit(
+    existingUrl: String,
+    name: String,
+    url: String,
+    allowHttp: Boolean
+): SubscriptionEdit? {
+    val cleanName = name.trim().take(160)
+    val cleanUrl = url.trim()
+    if (cleanName.isEmpty() || cleanUrl.isEmpty() || cleanUrl.length > 8_192) return null
+    if ('\r' in cleanUrl || '\n' in cleanUrl) return null
+    if (SubscriptionClient.isEncryptedSource(cleanUrl)) {
+        val classified = ImportClassifier.classify(cleanUrl) as? ImportClassification.Ready ?: return null
+        return if (classified.kind == ImportKind.SUBSCRIPTION) SubscriptionEdit(cleanName, classified.normalized) else null
+    }
+    val parsed = runCatching { URL(cleanUrl) }.getOrNull() ?: return null
+    if (parsed.host.isBlank()) return null
+    val scheme = parsed.protocol.lowercase(Locale.US)
+    val keepsExistingHttp = scheme == "http" && cleanUrl == existingUrl.trim()
+    if (scheme != "https" && !(scheme == "http" && (allowHttp || keepsExistingHttp))) return null
+    return SubscriptionEdit(cleanName, cleanUrl)
+}

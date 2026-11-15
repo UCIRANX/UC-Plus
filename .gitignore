@@ -1,0 +1,25 @@
+# Gradle and Android build output
+.gradle/
+**/build/
+*.apk
+*.aab
+*.ap_
+.idea/
+.vscode/
+*.iml
+local.properties
+
+# Native engines are built by CI (android/tools/build_native_libs.sh), never committed
+android/app/src/main/jniLibs/*/*.so
+
+# Source archive uploaded for CI, unpacked there
+UC-Plus-source.zip
+
+# Release signing key lives in the GitHub secret KEYSTORE_BASE64, never in the repository
+android/keystore/
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.log
+*.swp

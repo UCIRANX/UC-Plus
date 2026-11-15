@@ -1,0 +1,44 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Lumen</string>
+    <string name="connect">连接</string>
+    <string name="disconnect">断开连接</string>
+    <string name="connected">已连接</string>
+    <string name="connecting">正在连接…</string>
+    <string name="disconnected">已断开</string>
+    <string name="error">错误</string>
+    <string name="servers">服务器</string>
+    <string name="subscriptions">订阅</string>
+    <string name="routing">路由</string>
+    <string name="settings">设置</string>
+    <string name="logs">日志</string>
+    <string name="add_subscription">添加订阅</string>
+    <string name="auto_select">自动选择</string>
+    <string name="ping_all">探测延迟</string>
+    <string name="speed_test">速度测试</string>
+    <string name="protocol_vless">VLESS</string>
+    <string name="protocol_vmess">VMess</string>
+    <string name="protocol_trojan">Trojan</string>
+    <string name="protocol_ss">Shadowsocks</string>
+    <string name="protocol_hy2">Hysteria 2</string>
+    <string name="protocol_tuic">TUIC</string>
+    <string name="protocol_wg">WireGuard</string>
+    <string name="protocol_awg">AmneziaWG</string>
+    <string name="protocol_openvpn">OpenVPN</string>
+    <string name="engine_singbox">sing-box</string>
+    <string name="split_tunneling">分流</string>
+    <string name="per_app_vpn">按应用代理</string>
+    <string name="node_editor_title">编辑服务器</string>
+    <string name="server_address">服务器地址</string>
+    <string name="server_port">端口</string>
+    <string name="uuid_password">UUID / 密码</string>
+    <string name="sni">SNI</string>
+    <string name="flow">流模式</string>
+    <string name="alpn">ALPN</string>
+    <string name="fingerprint">指纹</string>
+    <string name="public_key">公钥</string>
+    <string name="short_id">短 ID</string>
+    <string name="awg_junk_params">AWG 混淆参数</string>
+    <string name="widget_description">快速连接到所选服务器</string>
+    <string name="widget_compact_description">紧凑型 1×1 开关按钮</string>
+</resources>

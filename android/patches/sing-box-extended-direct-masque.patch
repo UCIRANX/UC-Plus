@@ -1,0 +1,156 @@
+diff --git a/option/masque.go b/option/masque.go
+index bb50f95..75fe126 100644
+--- a/option/masque.go
++++ b/option/masque.go
+@@ -12,0 +13,6 @@ type MASQUEOutboundOptions struct {
++	Server               string                           `json:"server,omitempty"`
++	ServerPort           uint16                           `json:"server_port,omitempty"`
++	PrivateKey           string                           `json:"private_key,omitempty"`
++	PublicKey            string                           `json:"public_key,omitempty"`
++	TunnelAddress        badoption.Listable[netip.Prefix] `json:"tunnel_address,omitempty"`
++	MTU                  uint32                           `json:"mtu,omitempty"`
+diff --git a/protocol/masque/config.go b/protocol/masque/config.go
+index f1242f6..6c524e0 100644
+--- a/protocol/masque/config.go
++++ b/protocol/masque/config.go
+@@ -41 +41,5 @@ func (c *Config) GetEcEndpointPublicKey() (*ecdsa.PublicKey, error) {
+-		return nil, fmt.Errorf("failed to decode endpoint public key")
++		derBytes, err := base64.StdEncoding.DecodeString(c.EndpointPubKey)
++		if err != nil {
++			return nil, fmt.Errorf("failed to decode endpoint public key: %v", err)
++		}
++		endpointPubKeyB64 = &pem.Block{Type: "PUBLIC KEY", Bytes: derBytes}
+diff --git a/protocol/masque/lumen_direct_test.go b/protocol/masque/lumen_direct_test.go
+new file mode 100644
+index 0000000..d910adf
+--- /dev/null
++++ b/protocol/masque/lumen_direct_test.go
+@@ -0,0 +1,50 @@
++package masque
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"encoding/base64"
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/json/badoption"
++)
++
++func TestLumenDirectSingleStack(t *testing.T) {
++	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	privateDER, _ := x509.MarshalECPrivateKey(key)
++	publicDER, _ := x509.MarshalPKIXPublicKey(&key.PublicKey)
++	for _, address := range []string{"10.0.0.2/32", "fd00::2/128"} {
++		w := &Outbound{options: option.MASQUEOutboundOptions{
++			Server: "162.159.197.1", PrivateKey: base64.StdEncoding.EncodeToString(privateDER),
++			PublicKey:     base64.StdEncoding.EncodeToString(publicDER),
++			TunnelAddress: badoption.Listable[netip.Prefix]{netip.MustParsePrefix(address)},
++		}}
++		config, err := w.createDirectConfig()
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := config.GetEcPrivateKey(); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := config.GetEcEndpointPublicKey(); err != nil {
++			t.Fatal(err)
++		}
++		if address == "10.0.0.2/32" && (config.IPv4 != "10.0.0.2" || config.IPv6 != "") {
++			t.Fatal("IPv4-only profile changed")
++		}
++		if address == "fd00::2/128" && (config.IPv6 != "fd00::2" || config.IPv4 != "") {
++			t.Fatal("IPv6-only profile changed")
++		}
++	}
++	w := &Outbound{options: option.MASQUEOutboundOptions{Server: "162.159.197.1"}}
++	if _, err := w.createDirectConfig(); err == nil {
++		t.Fatal("missing direct credentials accepted")
++	}
++}
+diff --git a/protocol/masque/outbound.go b/protocol/masque/outbound.go
+index 3eed12f..0d2e9c9 100644
+--- a/protocol/masque/outbound.go
++++ b/protocol/masque/outbound.go
+@@ -71 +71,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+-		if !options.Profile.Recreate && cacheFile != nil && cacheFile.StoreMASQUEConfig() {
++		if options.Server != "" || options.PrivateKey != "" || options.PublicKey != "" {
++			appConfig, err = outbound.createDirectConfig()
++			if err != nil {
++				logger.ErrorContext(ctx, err)
++				return
++			}
++		} else if !options.Profile.Recreate && cacheFile != nil && cacheFile.StoreMASQUEConfig() {
+@@ -144 +150,5 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+-			endpoint, err = appConfig.SelectEndpointFromConfig(useHTTP2, options.UseIPv6, 443)
++			serverPort := int(options.ServerPort)
++			if serverPort == 0 {
++				serverPort = 443
++			}
++			endpoint, err = appConfig.SelectEndpointFromConfig(useHTTP2, options.UseIPv6, serverPort)
+@@ -192,0 +203,16 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
++		tunnelAddress := make([]netip.Prefix, 0, 2)
++		for _, prefix := range options.TunnelAddress {
++			tunnelAddress = append(tunnelAddress, prefix)
++		}
++		if len(tunnelAddress) == 0 {
++			if appConfig.IPv4 != "" {
++				tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv4+"/32"))
++			}
++			if appConfig.IPv6 != "" {
++				tunnelAddress = append(tunnelAddress, netip.MustParsePrefix(appConfig.IPv6+"/128"))
++			}
++		}
++		if len(tunnelAddress) == 0 {
++			logger.ErrorContext(ctx, E.New("MASQUE profile contains no tunnel address"))
++			return
++		}
+@@ -206,5 +232,2 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
+-				Dialer: outboundDialer,
+-				Address: []netip.Prefix{
+-					netip.MustParsePrefix(appConfig.IPv4 + "/32"),
+-					netip.MustParsePrefix(appConfig.IPv6 + "/128"),
+-				},
++				Dialer:               outboundDialer,
++				Address:              tunnelAddress,
+@@ -376,0 +400,32 @@ func (w *Outbound) createConfig() (*Config, error) {
++
++func (w *Outbound) createDirectConfig() (*Config, error) {
++	if w.options.Server == "" || w.options.PrivateKey == "" || w.options.PublicKey == "" {
++		return nil, E.New("direct MASQUE requires server, private_key and public_key")
++	}
++	server := w.options.Server
++	if net.ParseIP(server) == nil {
++		return nil, E.New("direct MASQUE server must be an IP address")
++	}
++	config := &Config{
++		PrivateKey:     w.options.PrivateKey,
++		EndpointV4:     server,
++		EndpointH2V4:   server,
++		EndpointPubKey: w.options.PublicKey,
++	}
++	for _, prefix := range w.options.TunnelAddress {
++		address := prefix.Addr().Unmap()
++		if address.Is4() {
++			config.IPv4 = address.String()
++		} else if address.Is6() {
++			config.IPv6 = address.String()
++		}
++	}
++	if config.IPv4 == "" && config.IPv6 == "" {
++		return nil, E.New("direct MASQUE requires at least one address")
++	}
++	if config.IPv6 != "" {
++		config.EndpointV6 = server
++		config.EndpointH2V6 = server
++	}
++	return config, nil
++}
