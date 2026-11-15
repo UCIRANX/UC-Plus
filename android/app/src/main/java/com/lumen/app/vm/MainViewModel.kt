@@ -2776,6 +2776,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val pending = java.util.Collections.synchronizedSet(targetIds.toMutableSet())
                 val completedPings = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
                 val semaphore = kotlinx.coroutines.sync.Semaphore(limit)
+                // Only one temporary core runs at a time; the probes inside it are gated separately.
+                val batchSlot = kotlinx.coroutines.sync.Semaphore(1)
                 // Same protocol order as the server list; AUTO pools stay last.
                 val ordered = targets.sortedWith(
                     compareBy<NodeEntity>({ it.isAutoNode || it.protocol.equals("auto", true) },
@@ -2797,39 +2799,51 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
                 if (group.isNotEmpty()) units.add(group)
+                // Every finished node is stored and shown at once, not when its whole group is done.
+                suspend fun finishNode(id: String, ping: Int) {
+                    val persistedPing = ping.coerceAtLeast(0)
+                    nodeDao.updatePing(id, persistedPing)
+                    completedPings[id] = persistedPing
+                    // Runs on the cancellation path too, so no row stays measuring.
+                    synchronized(pending) {
+                        pending.remove(id)
+                        if (bulkPingGeneration == generation) {
+                            _pingingNodeIds.update { it - id }
+                            _bulkPingProgress.value = (targets.size - pending.size) to targets.size
+                        }
+                    }
+                }
+                suspend fun measureAndFinish(node: NodeEntity) {
+                    try {
+                        // Repeats the probe and aggregates it per the ping settings.
+                        val ping = measureNodePing(node)
+                        currentCoroutineContext().ensureActive()
+                        finishNode(node.id, ping)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        // One failing node must not abort the run for all the others.
+                        runCatching { finishNode(node.id, 0) }
+                        log("Ping failed for ${node.name}: ${e.message}")
+                    }
+                }
                 val jobs = units.map { unit ->
                     async {
                         try {
-                            semaphore.withPermit {
-                                val batched = if (unit.size > 1) batchProxyPing(unit) else emptyMap()
-                                for (node in unit) {
-                                    try {
-                                        // Repeats the probe and aggregates it per the ping settings.
-                                        val ping = batched[node.id] ?: measureNodePing(node)
-                                        val persistedPing = ping.coerceAtLeast(0)
-                                        currentCoroutineContext().ensureActive()
-                                        nodeDao.updatePing(node.id, persistedPing)
-                                        completedPings[node.id] = persistedPing
-                                    } catch (e: kotlinx.coroutines.CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        // One failing node must not abort the run for all the others.
-                                        runCatching {
-                                            nodeDao.updatePing(node.id, 0)
-                                            completedPings[node.id] = 0
-                                        }
-                                        log("Ping failed for ${node.name}: ${e.message}")
-                                    } finally {
-                                        // Runs on the cancellation path too, so no row stays measuring.
-                                        synchronized(pending) {
-                                            pending.remove(node.id)
-                                            if (bulkPingGeneration == generation) {
-                                                _pingingNodeIds.update { it - node.id }
-                                                _bulkPingProgress.value = (targets.size - pending.size) to targets.size
-                                            }
-                                        }
+                            if (unit.size > 1) {
+                                val reported = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+                                batchSlot.withPermit {
+                                    batchProxyPing(unit) { id, ping ->
+                                        reported.add(id)
+                                        finishNode(id, ping)
                                     }
                                 }
+                                // Nodes the batch could not test fall back to the single-node path.
+                                for (node in unit) {
+                                    if (node.id !in reported) semaphore.withPermit { measureAndFinish(node) }
+                                }
+                            } else {
+                                semaphore.withPermit { measureAndFinish(unit[0]) }
                             }
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
@@ -3488,7 +3502,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * of every outbound. Nodes that need more than a plain outbound (sidecars, obfs relays,
      * endpoints, detours) are missing from the result, so the caller probes them one by one.
      */
-    private suspend fun batchProxyPing(group: List<NodeEntity>): Map<String, Int> {
+    private suspend fun batchProxyPing(
+        group: List<NodeEntity>,
+        onResult: suspend (String, Int) -> Unit = { _, _ -> }
+    ): Map<String, Int> {
         val app = getApplication<Application>()
         val binary = File(app.applicationInfo.nativeLibraryDir, "libsingbox.so")
         if (!binary.isFile) return emptyMap()
@@ -3568,9 +3585,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (!listening || !child.isAlive) return emptyMap()
             val url = httpPingTargets(settingsNow.pingUrl, iranNetwork = iran).first()
+            // Probes start as soon as a slot is free and report back one by one (sliding window).
+            val gate = kotlinx.coroutines.sync.Semaphore(PingBudget.CORE_PING_CONCURRENCY)
             kotlinx.coroutines.coroutineScope {
                 probeTags.map { (id, tag) ->
-                    async(Dispatchers.IO) { id to clashDelay(port, tag, url, timeoutMs) }
+                    async(Dispatchers.IO) {
+                        val delayMs = gate.withPermit { clashDelay(port, tag, url, timeoutMs) }
+                        onResult(id, delayMs)
+                        id to delayMs
+                    }
                 }.awaitAll()
             }.toMap()
         } catch (e: kotlinx.coroutines.CancellationException) {
@@ -4740,7 +4763,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /** Ping methods that start a temporary core for the node instead of probing its endpoint. */
         private val CORE_PING_TYPES = setOf("http")
         /** Plain nodes probed per temporary core in HTTP mode (one core start instead of one per node). */
-        private const val PING_BATCH_SIZE = 8
+        private const val PING_BATCH_SIZE = 256
         private val NON_PROXY_OUTBOUND_TYPES = setOf("direct", "block", "dns", "selector", "urltest")
         /** Protocols whose endpoint only listens on UDP, so a TCP connect can never succeed. */
         private val UDP_ONLY_SCHEMES = setOf(
