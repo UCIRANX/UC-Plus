@@ -8,7 +8,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 
 /** Blocking DNS/socket APIs must not hold a coroutine or its probe permit after cancellation. */
 internal object ProbeIo {
-    private val executor = ThreadPoolExecutor(128, 128, 30, TimeUnit.SECONDS, LinkedBlockingQueue()) { task ->
+    private val executor = ThreadPoolExecutor(32, 32, 30, TimeUnit.SECONDS, LinkedBlockingQueue()) { task ->
         Thread(task, "lumen-probe-io").apply { isDaemon = true }
     }.apply { allowCoreThreadTimeOut(true) }
 

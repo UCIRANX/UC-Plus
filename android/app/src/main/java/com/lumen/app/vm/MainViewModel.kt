@@ -31,7 +31,6 @@ import com.lumen.core.config.builder.SingboxConfigBuilder
 import com.lumen.core.config.builder.SingboxConfigOptions
 import com.lumen.core.config.parser.LinkParser
 import com.lumen.core.config.parser.ParsedNode
-import org.json.JSONArray
 import org.json.JSONObject
 import com.lumen.core.database.AppDatabase
 import com.lumen.core.database.model.NodeEntity
@@ -843,7 +842,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         validateProxyDataPath = prefs.getBoolean("validate_proxy_data_path", false),
         pingType = normalizedPingType(prefs.getString("server_speed_test_type", "http")),
         pingTimeoutMs = prefs.getInt("ping_timeout_ms", 2000),
-        pingConcurrency = prefs.getInt("ping_concurrency", 64),
+        pingConcurrency = prefs.getInt("ping_concurrency", 16),
         pingUrl = prefs.getString("ping_url", "https://www.gstatic.com/generate_204")
             ?: "https://www.gstatic.com/generate_204",
         pingAttempts = prefs.getInt("ping_attempts", 1),
@@ -1026,7 +1025,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .putBoolean("validate_proxy_data_path", s.validateProxyDataPath)
             .putString("server_speed_test_type", s.pingType)
             .putInt("ping_timeout_ms", s.pingTimeoutMs.coerceIn(500, 20000))
-            .putInt("ping_concurrency", s.pingConcurrency.coerceIn(1, 128))
+            .putInt("ping_concurrency", s.pingConcurrency.coerceIn(1, 32))
             .putString("ping_url", s.pingUrl.trim().take(512))
             .putInt("ping_attempts", s.pingAttempts.coerceIn(1, 10))
             .putString("ping_aggregate", s.pingAggregate)
@@ -2684,7 +2683,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val singlePingJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
 
     // The outer scheduler honours the configured count for ICMP too.
-    private val icmpSemaphore = kotlinx.coroutines.sync.Semaphore(128)
+    private val icmpSemaphore = kotlinx.coroutines.sync.Semaphore(32)
     // AUTO pools can contain hundreds of endpoints. Probe them concurrently, but keep one
     // shared ceiling across all AUTO nodes so large subscriptions cannot exhaust sockets.
     private val autoMemberPingSemaphore =
@@ -2751,7 +2750,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val limit = if (containsCoreBackedChecks) {
             cfg.pingConcurrency.coerceIn(1, PingBudget.CORE_PING_CONCURRENCY)
         } else {
-            cfg.pingConcurrency.coerceIn(1, 128)
+            cfg.pingConcurrency.coerceIn(1, 32)
         }
         // A new request always supersedes the old one. This makes every run start from a
         // clean slate even if the user changes a group or starts another check mid-flight.
@@ -2781,72 +2780,35 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     compareBy<NodeEntity>({ it.isAutoNode || it.protocol.equals("auto", true) },
                         { pingProtocolRank(it.protocol) })
                 )
-                // Plain HTTP nodes share one temporary core per group; everything else is a single-node unit.
-                val batchAllowed = mode == "http" && cfg.pingAttempts == 1
-                val units = ArrayList<List<NodeEntity>>()
-                var group = ArrayList<NodeEntity>()
-                for (node in ordered) {
-                    if (!(batchAllowed && canBatchPing(node))) {
-                        units.add(listOf(node))
-                        continue
-                    }
-                    group.add(node)
-                    if (group.size == PING_BATCH_SIZE) {
-                        units.add(group)
-                        group = ArrayList()
-                    }
-                }
-                if (group.isNotEmpty()) units.add(group)
-                // Every finished node is stored and shown at once, not when its whole group is done.
-                suspend fun finishNode(id: String, ping: Int) {
-                    val persistedPing = ping.coerceAtLeast(0)
-                    nodeDao.updatePing(id, persistedPing)
-                    completedPings[id] = persistedPing
-                    // Runs on the cancellation path too, so no row stays measuring.
-                    synchronized(pending) {
-                        pending.remove(id)
-                        if (bulkPingGeneration == generation) {
-                            _pingingNodeIds.update { it - id }
-                            _bulkPingProgress.value = (targets.size - pending.size) to targets.size
-                        }
-                    }
-                }
-                suspend fun measureAndFinish(node: NodeEntity) {
-                    try {
-                        // Repeats the probe and aggregates it per the ping settings.
-                        val ping = measureNodePing(node)
-                        currentCoroutineContext().ensureActive()
-                        finishNode(node.id, ping)
-                    } catch (e: kotlinx.coroutines.CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        // One failing node must not abort the run for all the others.
-                        runCatching { finishNode(node.id, 0) }
-                        log("Ping failed for ${node.name}: ${e.message}")
-                    }
-                }
-                val jobs = units.map { unit ->
+                val jobs = ordered.map { node ->
                     async {
                         try {
-                            if (unit.size > 1) {
-                                val reported = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-                                semaphore.withPermit {
-                                    batchProxyPing(unit) { id, ping ->
-                                        reported.add(id)
-                                        finishNode(id, ping)
-                                    }
-                                }
-                                // Nodes the batch could not test fall back to the single-node path.
-                                for (node in unit) {
-                                    if (node.id !in reported) semaphore.withPermit { measureAndFinish(node) }
-                                }
-                            } else {
-                                semaphore.withPermit { measureAndFinish(unit[0]) }
+                            semaphore.withPermit {
+                                // Repeats the probe and aggregates it per the ping settings.
+                                val ping = measureNodePing(node)
+                                val persistedPing = ping.coerceAtLeast(0)
+                                currentCoroutineContext().ensureActive()
+                                nodeDao.updatePing(node.id, persistedPing)
+                                completedPings[node.id] = persistedPing
                             }
                         } catch (e: kotlinx.coroutines.CancellationException) {
                             throw e
                         } catch (e: Exception) {
-                            log("Ping group failed: ${e.message}")
+                            // One failing node must not abort the run for all the others.
+                            runCatching {
+                                nodeDao.updatePing(node.id, 0)
+                                completedPings[node.id] = 0
+                            }
+                            log("Ping failed for ${node.name}: ${e.message}")
+                        } finally {
+                            // Runs on the cancellation path too, so no row stays measuring.
+                            synchronized(pending) {
+                                pending.remove(node.id)
+                                if (bulkPingGeneration == generation) {
+                                    _pingingNodeIds.update { it - node.id }
+                                    _bulkPingProgress.value = (targets.size - pending.size) to targets.size
+                                }
+                            }
                         }
                     }
                 }
@@ -3481,166 +3443,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { relay?.stop() }
             runCatching { workDir.deleteRecursively() }
         }
-    }
-
-    /**
-     * Only plain HTTP-probed nodes can share a batch core. The active node keeps its live
-     * session check, and SSTP, OpenVPN, AUTO and protected profiles keep their own paths.
-     */
-    private fun canBatchPing(node: NodeEntity): Boolean {
-        val protocol = node.protocol.trim().lowercase(Locale.US)
-        return !node.isAutoNode && protocol != "auto" && protocol != "sstp" && protocol != "openvpn" &&
-            !node.link.startsWith(ProtectedProfileCodec.PREFIX) &&
-            !(node.id == activeNode.value?.id && LumenVpnService.isRunning.value)
-    }
-
-    /**
-     * Probes a group of plain nodes through ONE temporary sing-box core. Each node keeps its
-     * own outbound, renamed so tags cannot clash, and the core's Clash API reports the delay
-     * of every outbound. Nodes that need more than a plain outbound (sidecars, obfs relays,
-     * endpoints, detours) are missing from the result, so the caller probes them one by one.
-     */
-    private suspend fun batchProxyPing(
-        group: List<NodeEntity>,
-        onResult: suspend (String, Int) -> Unit = { _, _ -> }
-    ): Map<String, Int> {
-        val app = getApplication<Application>()
-        val binary = File(app.applicationInfo.nativeLibraryDir, "libsingbox.so")
-        if (!binary.isFile) return emptyMap()
-        val workDir = File(app.cacheDir, "ping-tests/${UUID.randomUUID()}").apply { mkdirs() }
-        val configFile = File(workDir, "config.json")
-        val timeoutMs = pingTimeout()
-        var process: Process? = null
-        return try {
-            val settingsNow = _settings.value
-            val iran = geoRegionCode(settingsNow.geoResourceSource) == "ir"
-            val outbounds = JSONArray()
-            val probeTags = LinkedHashMap<String, String>()
-            // Address lookups run in parallel; a serial loop made every node wait for the previous lookup.
-            val pinnedByNode: Map<String, Map<String, List<String>>> = kotlinx.coroutines.coroutineScope {
-                group.map { entity ->
-                    async(Dispatchers.IO) {
-                        val host = runCatching { parseEntity(entity).server }.getOrNull()
-                        val pinnedMap: Map<String, List<String>> = if (host == null) emptyMap() else ProbeIo.run {
-                            runCatching {
-                                ServerAddressPinner.pinnedAddresses(
-                                    hostnames = listOf(host),
-                                    foreignResolver = settingsNow.dnsDirectServers.lineSequence()
-                                        .firstOrNull()?.trim().orEmpty().ifBlank { "1.1.1.1" },
-                                    preferSystemDns = iran
-                                )
-                            }.getOrDefault(emptyMap())
-                        }
-                        entity.id to pinnedMap
-                    }
-                }.awaitAll().toMap()
-            }
-            group.forEachIndexed { index, entity ->
-                val parsed = runCatching { parseEntity(entity) }.getOrNull() ?: return@forEachIndexed
-                if (obfsBridgeOf(parsed) != null) return@forEachIndexed
-                val pinned = pinnedByNode[entity.id].orEmpty()
-                val json = runCatching {
-                    JSONObject(HybridConfigBuilder.buildConfig(
-                        parsed,
-                        pingSingboxOptions(0, SingboxConfigBuilder.OBFS_LOCAL_PORT, workDir, pinned),
-                        CoreMode.of(settingsNow.engine),
-                        { availableTcpPort(emptySet()) }
-                    ))
-                }.getOrNull() ?: return@forEachIndexed
-                if (json.has(HybridConfigBuilder.SIDECAR_KEY) || json.has("endpoints")) return@forEachIndexed
-                val entries = json.optJSONArray("outbounds") ?: return@forEachIndexed
-                val all = (0 until entries.length()).map { entries.getJSONObject(it) }
-                if (all.any { it.has("detour") }) return@forEachIndexed
-                val proxies = all.filter { it.optString("type") !in NON_PROXY_OUTBOUND_TYPES }
-                if (proxies.size != 1) return@forEachIndexed
-                val copy = JSONObject(proxies[0].toString())
-                if (copy.has("domain_resolver")) {
-                    // The resolver only matters for a hostname. A hostname without a usable
-                    // pinned address would resolve through system DNS, so such a node is skipped.
-                    val host = copy.optString("server")
-                    val literalIp = host.matches(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")) || host.contains(':')
-                    if (!literalIp) return@forEachIndexed
-                    copy.remove("domain_resolver")
-                }
-                val tag = "n${index}_${copy.optString("tag")}"
-                outbounds.put(copy.put("tag", tag))
-                probeTags[entity.id] = tag
-            }
-            if (probeTags.isEmpty()) return emptyMap()
-            val port = availableTcpPort(emptySet())
-            if (port <= 0) return emptyMap()
-            outbounds.put(JSONObject().put("type", "direct").put("tag", "direct"))
-            val root = JSONObject()
-                .put("log", JSONObject().put("disabled", true))
-                .put("outbounds", outbounds)
-                .put("experimental", JSONObject().put("clash_api",
-                    JSONObject().put("external_controller", "127.0.0.1:$port")))
-            configFile.writeText(root.toString(), Charsets.UTF_8)
-            val child = ProcessBuilder(binary.absolutePath, "run", "-c", configFile.absolutePath)
-                .apply { environment()["GOMAXPROCS"] = "1" }
-                .directory(workDir)
-                .redirectErrorStream(true)
-                .redirectOutput(File(workDir, "core.log"))
-                .start()
-            process = child
-            val readyDeadline = System.nanoTime() + timeoutMs.coerceAtLeast(2_000).toLong() * 1_000_000L
-            var listening = false
-            while (System.nanoTime() < readyDeadline && child.isAlive) {
-                listening = runCatching {
-                    Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 100) }
-                    true
-                }.getOrDefault(false)
-                if (listening) break
-                delay(50)
-            }
-            if (!listening || !child.isAlive) return emptyMap()
-            val url = httpPingTargets(settingsNow.pingUrl, iranNetwork = iran).first()
-            // Probes start as soon as a slot is free and report back one by one (sliding window).
-            val gate = kotlinx.coroutines.sync.Semaphore(PingBudget.CORE_PING_CONCURRENCY)
-            kotlinx.coroutines.coroutineScope {
-                probeTags.map { (id, tag) ->
-                    async(Dispatchers.IO) {
-                        val delayMs = gate.withPermit { clashDelay(port, tag, url, timeoutMs) }
-                        onResult(id, delayMs)
-                        id to delayMs
-                    }
-                }.awaitAll()
-            }.toMap()
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            log("Batch ping setup failed: ${e.javaClass.simpleName}")
-            emptyMap()
-        } finally {
-            process?.let { child ->
-                runCatching { child.destroy() }
-                if (child.isAlive) runCatching { child.waitFor(1_000, TimeUnit.MILLISECONDS) }
-                if (child.isAlive) runCatching { child.destroyForcibly() }
-            }
-            runCatching { workDir.deleteRecursively() }
-        }
-    }
-
-    /** Delay of one outbound through the core's Clash API; -1 when it did not answer. */
-    private fun clashDelay(port: Int, tag: String, url: String, timeoutMs: Int): Int = try {
-        val encodedTag = java.net.URLEncoder.encode(tag, "UTF-8").replace("+", "%20")
-        val endpoint = "http://127.0.0.1:$port/proxies/$encodedTag/delay" +
-            "?timeout=$timeoutMs&url=${java.net.URLEncoder.encode(url, "UTF-8")}"
-        val conn = java.net.URL(endpoint).openConnection() as java.net.HttpURLConnection
-        try {
-            conn.connectTimeout = 2_000
-            conn.readTimeout = timeoutMs + 2_000
-            if (conn.responseCode !in 200..299) {
-                -1
-            } else {
-                JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-                    .optInt("delay", 0).takeIf { it > 0 } ?: -1
-            }
-        } finally {
-            conn.disconnect()
-        }
-    } catch (e: Exception) {
-        -1
     }
 
     private fun availableTcpPort(excluded: Set<Int>): Int {
@@ -4772,9 +4574,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private val USAGE_KEYS = listOf("upload", "download", "total", "expire")
         /** Ping methods that start a temporary core for the node instead of probing its endpoint. */
         private val CORE_PING_TYPES = setOf("http")
-        /** Plain nodes probed per temporary core in HTTP mode (one core start instead of one per node). */
-        private const val PING_BATCH_SIZE = 8
-        private val NON_PROXY_OUTBOUND_TYPES = setOf("direct", "block", "dns", "selector", "urltest")
         /** Protocols whose endpoint only listens on UDP, so a TCP connect can never succeed. */
         private val UDP_ONLY_SCHEMES = setOf(
             "wireguard", "amneziawg", "awg", "wg", "warp",
