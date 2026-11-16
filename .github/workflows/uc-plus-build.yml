@@ -8,6 +8,10 @@ name: UC Plus build and release
 
 on:
   push:
+    # Branch pushes only. Tag pushes ignore "paths", so without this the release tags
+    # created by this workflow would start it again.
+    branches:
+      - "**"
     paths:
       - "UC-Plus-source.zip"
   workflow_dispatch:
@@ -58,7 +62,8 @@ jobs:
             echo "The repository already matches the archive."
           else
             git commit -m "Apply UC Plus source archive [skip ci]"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            # Explicit branch ref: a run can start from a tag checkout, and a bare name would hit the tag.
+            git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"
           fi
 
       - name: Set up JDK 17
