@@ -319,7 +319,7 @@ data class SettingsUiState(
     val showNotification: Boolean = true,
     val showNotificationSpeed: Boolean = true,
     val pingType: String = "http",
-    val pingTimeoutMs: Int = 2000,
+    val pingTimeoutMs: Int = 1500,
     val pingConcurrency: Int = 64,
     val pingUrl: String = "https://www.google.com/generate_204",
     val pingAttempts: Int = 1,

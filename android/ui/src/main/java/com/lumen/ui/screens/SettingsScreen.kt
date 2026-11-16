@@ -2775,7 +2775,7 @@ private fun PingSettings(
 
 
 
-                        pingTimeoutMs = 2000,
+                        pingTimeoutMs = 1500,
 
 
 

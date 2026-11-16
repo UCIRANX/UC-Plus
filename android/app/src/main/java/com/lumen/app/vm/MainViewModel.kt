@@ -841,7 +841,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         reconnectOnNetworkChange = prefs.getBoolean("reconnect_on_network_change", true),
         validateProxyDataPath = prefs.getBoolean("validate_proxy_data_path", false),
         pingType = normalizedPingType(prefs.getString("server_speed_test_type", "http")),
-        pingTimeoutMs = prefs.getInt("ping_timeout_ms", 2000),
+        pingTimeoutMs = prefs.getInt("ping_timeout_ms", 1500),
         pingConcurrency = prefs.getInt("ping_concurrency", 16),
         pingUrl = prefs.getString("ping_url", "https://www.gstatic.com/generate_204")
             ?: "https://www.gstatic.com/generate_204",
@@ -3395,8 +3395,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     -1
                 } else {
                     var result = -1
+                    // One HTTP exchange per server. The fallback destinations are no longer
+                    // tried, so a dead server costs one timeout instead of three.
                     val urls = httpPingTargets(_settings.value.pingUrl,
-                        iranNetwork = geoRegionCode(_settings.value.geoResourceSource) == "ir")
+                        iranNetwork = geoRegionCode(_settings.value.geoResourceSource) == "ir").take(1)
                     val warmupDeadline = System.nanoTime() + PingBudget.setupMs(pingTimeout()).toLong() * 1_000_000L
                     do {
                         for (url in urls) {
@@ -4714,8 +4716,8 @@ internal object PingBudget {
         // Core-backed repeats share one temporary process. Each sample includes
         // setup and response phases, plus fallback exchanges after a failure.
         // SOCKS connect includes outbound DNS/handshake; HTTPS then has its own
-        // handshake. Default targets have up to three independent exchanges.
-        val probes = tries * if (realCheck) 3L * (2L * setupMs(timeoutMs, iranNetwork) + timeout) else timeout
+        // handshake. The real check makes one exchange per server.
+        val probes = tries * if (realCheck) 1L * (2L * setupMs(timeoutMs, iranNetwork) + timeout) else timeout
         // Address pinning performs at most one 2.5 s UDP DNS query before startup.
         val startup = if (realCheck) timeout + if (iranNetwork) 5_000L else 3_000L
             else if (iranNetwork) 5_000L else 0L
