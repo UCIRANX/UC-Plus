@@ -2728,14 +2728,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         if (wasRunning) log("Ping stopped")
     }
 
-    // Amnezia first, then OpenVPN, then SSTP, then everything else (matches the list order).
-    private fun pingProtocolRank(protocol: String): Int = when (protocol.trim().lowercase(Locale.US)) {
-        "awg", "amneziawg", "amnezia" -> 0
-        "openvpn" -> 1
-        "sstp" -> 2
-        else -> 3
-    }
-
     private fun pingNodeListInternal(targets: List<NodeEntity>) {
         if (targets.isEmpty()) return
         val cfg = _settings.value
@@ -2775,11 +2767,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 val pending = java.util.Collections.synchronizedSet(targetIds.toMutableSet())
                 val completedPings = java.util.Collections.synchronizedMap(mutableMapOf<String, Int>())
                 val semaphore = kotlinx.coroutines.sync.Semaphore(limit)
-                // Same protocol order as the server list; AUTO pools stay last.
-                val ordered = targets.sortedWith(
-                    compareBy<NodeEntity>({ it.isAutoNode || it.protocol.equals("auto", true) },
-                        { pingProtocolRank(it.protocol) })
-                )
+                val isAutoTarget: (NodeEntity) -> Boolean = { it.isAutoNode || it.protocol.equals("auto", true) }
+                // Servers are tested in random order, so neither the protocol nor the config
+                // number decides the sequence. AUTO pools stay last because they use their members' results.
+                val ordered = targets.filterNot(isAutoTarget).shuffled() + targets.filter(isAutoTarget)
                 val jobs = ordered.map { node ->
                     async {
                         try {
