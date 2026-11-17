@@ -63,7 +63,8 @@ open class TorRunnerService : Service() {
 
     private var slot = 0
     private var pt: PtManager? = null
-    private var proc: Process? = null
+    // android.os.Process is imported for killProcess, so the tor child process is named in full.
+    private var proc: java.lang.Process? = null
     private var bound = false
     private var started = false
     @Volatile private var stopping = false
