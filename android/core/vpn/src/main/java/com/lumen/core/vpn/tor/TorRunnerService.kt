@@ -139,35 +139,28 @@ open class TorRunnerService : Service() {
     }
 
     /**
-     * Copies Tor's GeoIP databases from the app assets into the slot directory, when the build
-     * ships them. Their paths go into the config so the torrc can use them.
+     * The exit country's GeoIP files come from the config (downloaded by the app). A file that is
+     * missing is dropped, and the exit restriction is reported in the VPN log instead of failing.
      */
-    private fun installGeoIp(dir: File, cfg: JSONObject) {
-        for (name in listOf("geoip", "geoip6")) {
-            val target = File(dir, name)
-            if (!target.exists()) {
-                runCatching {
-                    assets.open(name).use { input -> target.outputStream().use { input.copyTo(it) } }
-                }.onFailure { target.delete() }
-            }
+    private fun checkGeoIp(cfg: JSONObject) {
+        for (key in listOf("geoip_file", "geoip6_file")) {
+            val path = cfg.optString(key)
+            if (path.isNotEmpty() && !File(path).exists()) cfg.remove(key)
         }
-        File(dir, "geoip").takeIf { it.exists() }?.let { cfg.put("geoip_file", it.absolutePath) }
-        File(dir, "geoip6").takeIf { it.exists() }?.let { cfg.put("geoip6_file", it.absolutePath) }
         val exit = cfg.optString("exit_country")
-        if (exit.isNotEmpty()) {
-            val hasGeoIp = File(dir, "geoip").exists()
-            com.lumen.core.vpn.VpnLogBus.info("Tor", "Exit country $exit requested; GeoIP ${if (hasGeoIp) "loaded" else "missing"}")
-        }
-        if (!File(dir, "geoip").exists() && cfg.optString("exit_country").isNotEmpty()) {
+        if (exit.isEmpty()) return
+        if (cfg.optString("geoip_file").isNotEmpty()) {
+            com.lumen.core.vpn.VpnLogBus.info("Tor", "Exit country $exit: GeoIP file loaded")
+        } else {
             com.lumen.core.vpn.VpnLogBus.warning("Tor",
-                "No GeoIP data in this build: the exit country cannot be enforced, the IP may differ.")
+                "Exit country $exit: no GeoIP file, the exit is not restricted and the IP may differ")
         }
     }
 
     private fun launchProcess(cfg: JSONObject, lines: List<String>, dir: File, torBin: File) {
         val ports = startTransports(lines)
         val dataDir = File(dir, "data").apply { mkdirs() }
-        installGeoIp(dir, cfg)
+        checkGeoIp(cfg)
         val torrc = File(dir, "torrc")
         torrc.writeText(TorrcBuilder.build(cfg, lines, ports, dataDir))
         val out = File(dir, "stdout.log")

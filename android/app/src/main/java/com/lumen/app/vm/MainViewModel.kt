@@ -1395,6 +1395,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val countryLookupAttempted =
         java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
+    // Tor bridge countries from the workflow's GeoIP labelling. Tor nodes use only this map;
+    // the online IP lookup is not reliable for bridges.
+    private val _torBridgeCountries = MutableStateFlow(
+        com.lumen.core.config.tor.TorCountries.parseBridgeCountries(
+            prefs.getString(K_TOR_COUNTRIES, "").orEmpty()
+        )
+    )
+
     init {
         // Desktop Lumen resolves otherwise anonymous WireGuard endpoints through
         // GeoIP. Android does the same asynchronously and caches the result; WARP
@@ -1476,8 +1484,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             uiNodeEntities,
             _resolvedCountryCodes,
             groupEntities,
-            groupMembers
-        ) { list, resolvedCountryCodes, customGroups, members ->
+            groupMembers,
+            _torBridgeCountries
+        ) { list, resolvedCountryCodes, customGroups, members, torBridgeCountries ->
             val liveIds = HashSet<String>(list.size * 2)
             // Membership is keyed on the node's stable key, not its row id, so it
             // survives the delete/re-insert a subscription refresh does. Rows pointing
@@ -1502,7 +1511,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val mapped = list.mapNotNull { e ->
                 runCatching {
                     liveIds.add(e.id)
-                    val resolvedCountry = if (isWarpNode(e)) {
+                    val isTor = e.protocol.equals("tor", ignoreCase = true)
+                    val torCountry = if (isTor) {
+                        com.lumen.core.config.tor.TorBridges.decode(e.link)
+                            ?.let { com.lumen.core.config.tor.TorBridges.fingerprint(it) }
+                            ?.let { torBridgeCountries[it] }
+                            .orEmpty()
+                    } else ""
+                    val resolvedCountry = if (isWarpNode(e) || isTor) {
                         ""
                     } else {
                         resolvedCountryCodes[normalizedEndpointHost(e.server)].orEmpty()
@@ -1511,14 +1527,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val fingerprint = 31 * (31 * (31 * e.name.hashCode() + e.server.hashCode()) +
                         e.protocol.hashCode()) +
                         (e.outboundJson.hashCode() xor e.link.hashCode() xor
-                            resolvedCountry.hashCode() xor endpointCountry.hashCode()) + (if (e.favorite) 1 else 0)
+                            resolvedCountry.hashCode() xor endpointCountry.hashCode() xor
+                            torCountry.hashCode()) + (if (e.favorite) 1 else 0)
                     val cached = nodeUiCache[e.id]
                     val base = if (cached != null && cached.fingerprint == fingerprint) {
                         cached.base
                     } else {
                         val sourceName = e.name.ifBlank { e.server.ifBlank { "Server" } }
                         val safeServer = e.server
-                        val countryCode = runCatching {
+                        val countryCode = if (isTor) torCountry.uppercase(Locale.US) else runCatching {
                             endpointCountry
                                 .ifBlank { CountryFlagHelper.detectCountryStrict(sourceName, safeServer) }
                                 .ifBlank { resolvedCountry }
@@ -2408,6 +2425,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         adoptProfileTitle: Boolean = false,
         automatic: Boolean = false
     ): Int {
+        if (sub.url == TorBridges.SUBSCRIPTION_URL) refreshTorBridgeCountries()
         // Claim atomically: a StateFlow read+write does not serialize concurrent imports.
         if (!subscriptionRefreshClaims.add(sub.id)) return 0
         _refreshingIds.update { it + sub.id }
@@ -4227,9 +4245,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val exit = if (prefs.picked) {
             nodes.value.firstOrNull { it.id == _selectedNodeId.value }?.countryCode.orEmpty()
         } else prefs.country
+        val (geoip, geoip6) = exitGeoFiles(exit)
         val candidates = org.json.JSONArray()
         for (l in ordered) {
-            candidates.put(org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l).put("exit", exit))
+            candidates.put(
+                org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l)
+                    .put("exit", exit).put("geoip", geoip).put("geoip6", geoip6)
+            )
         }
         return org.json.JSONObject(configJson)
             .put("_lumen_tor", org.json.JSONObject().put("candidates", candidates))
@@ -4305,9 +4327,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         torPrefs.country = country
         torPrefs.picked = false
         _torCountry.value = country
-        val representative = nodes.value.firstOrNull {
-            it.protocol.equals("tor", ignoreCase = true) &&
-                (country.isEmpty() || it.countryCode.equals(country, ignoreCase = true))
+        // Taken from the same bridge-type filtered list that the country row counts, so the
+        // server shown as selected is always one of the bridges that will actually be used.
+        val representative = if (country.isEmpty()) {
+            torServersByCountry.value.values.firstOrNull()?.firstOrNull()
+        } else {
+            torServersByCountry.value[country]?.firstOrNull()
         }
         if (representative != null) {
             if (_selectedNodeId.value != representative.id) resetConnectedPing()
@@ -4585,7 +4610,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun shouldResolveEndpointCountry(entity: NodeEntity): Boolean {
         val protocol = entity.protocol.trim().lowercase(Locale.US)
-        if (protocol == "tor") return isLocatableTorBridge(entity)
+        if (protocol == "tor") return false
         if (protocol !in setOf("awg", "amneziawg", "wireguard", "wg")) return false
         if (CountryFlagHelper.detectCountryStrict(entity.name, entity.server).isNotEmpty()) return false
         return !isWarpNode(entity)
@@ -4613,6 +4638,54 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun normalizedEndpointKey(server: String, port: Int): String =
         "${normalizedEndpointHost(server)}:$port"
+
+    /** Text of a URL, or null when it cannot be fetched. Blocking: call it off the main thread. */
+    private fun fetchText(url: String): String? = runCatching {
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 8_000
+            readTimeout = 15_000
+            setRequestProperty("User-Agent", "Lumen-Android")
+        }
+        try {
+            if (connection.responseCode !in 200..299) null
+            else connection.inputStream.use { it.readBytes().toString(Charsets.UTF_8) }
+        } finally {
+            connection.disconnect()
+        }
+    }.getOrNull()
+
+    /** Reloads the bridge country map from the bridges branch. Keeps the old map when it fails. */
+    private fun refreshTorBridgeCountries() {
+        val text = fetchText(com.lumen.core.config.tor.TorBridges.COUNTRIES_URL) ?: return
+        val parsed = com.lumen.core.config.tor.TorCountries.parseBridgeCountries(text)
+        if (parsed.isEmpty()) return
+        prefs.edit().putString(K_TOR_COUNTRIES, text).apply()
+        _torBridgeCountries.value = parsed
+    }
+
+    /**
+     * GeoIP files of one country, as Tor needs them for an exit in that country. Each file is
+     * downloaded once and refreshed after a day. Returns empty paths when unavailable.
+     */
+    private fun exitGeoFiles(country: String): Pair<String, String> {
+        val code = com.lumen.core.config.tor.TorCountries.normalize(country)
+        if (code.isEmpty()) return "" to ""
+        val dir = File(getApplication<Application>().filesDir, "tor-geo").apply { mkdirs() }
+        val v4 = File(dir, "$code.geoip")
+        val v6 = File(dir, "$code.geoip6")
+        val day = 86_400_000L
+        if (!v4.exists() || System.currentTimeMillis() - v4.lastModified() > day) {
+            fetchText(com.lumen.core.config.tor.TorBridges.GEO_URL + "$code.geoip")
+                ?.takeIf { it.isNotBlank() }?.let { v4.writeText(it) }
+        }
+        if (!v6.exists() || System.currentTimeMillis() - v6.lastModified() > day) {
+            // Many countries have no IPv6 ranges, so a missing file here is normal.
+            fetchText(com.lumen.core.config.tor.TorBridges.GEO_URL + "$code.geoip6")
+                ?.takeIf { it.isNotBlank() }?.let { v6.writeText(it) }
+        }
+        return (if (v4.exists()) v4.absolutePath else "") to (if (v6.exists()) v6.absolutePath else "")
+    }
 
     private fun resolveCountryCode(host: String): String {
         val address = runCatching { InetAddress.getByName(host) }.getOrNull() ?: return ""
@@ -4706,6 +4779,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         const val PREFS_NAME = "lumen_prefs"
         private const val K_DISABLED_PROTOCOLS = "disabled_protocols"
+        private const val K_TOR_COUNTRIES = "tor_bridge_countries"
 
         /**
          * Launcher icon the user pinned. Read before [_settings] exists (startup

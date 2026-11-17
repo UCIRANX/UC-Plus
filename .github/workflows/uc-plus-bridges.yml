@@ -1,8 +1,8 @@
 name: UC Plus Tor bridges
 
-# Collects Tor bridges with tools/collect_bridges.py and publishes tor.txt and bridges.json
-# to the "bridges" branch. The app reads tor.txt from that branch and locates each bridge's
-# country itself.
+# Collects Tor bridges with tools/collect_bridges.py, labels each bridge's country with the
+# GeoIP ranges from tools/build_geo.py (tools/classify_bridges.py) and publishes tor.txt,
+# tor-countries.txt and geo/<cc>.geoip to the "bridges" branch. The app reads those files.
 #
 # Run it on demand: Actions -> "UC Plus Tor bridges" -> "Run workflow".
 # It also runs every hour on its own.
@@ -36,6 +36,14 @@ jobs:
           set -euo pipefail
           python3 tools/collect_bridges.py --out "$RUNNER_TEMP/bridges-out"
           echo "Collected lines in tor.txt: $(grep -c . "$RUNNER_TEMP/bridges-out/tor.txt" || true)"
+
+      - name: Build per-country GeoIP files and label each bridge's country
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/bridges-out"
+          python3 tools/build_geo.py --out "$out"
+          python3 tools/classify_bridges.py --out "$out"
+          echo "Labelled bridges: $(grep -c . "$out/tor-countries.txt" || true)"
 
       - name: Publish tor.txt and bridges.json to the "bridges" branch
         env:

@@ -554,7 +554,8 @@ ${hevAuthLines}misc:
                 (0 until list.length()).map { i ->
                     list.getJSONObject(i).let { c ->
                         com.lumen.core.vpn.tor.TorSidecar.Candidate(
-                            c.optString("transport"), c.getString("line"), c.optString("exit"))
+                            c.optString("transport"), c.getString("line"), c.optString("exit"),
+                            c.optString("geoip"), c.optString("geoip6"))
                     }
                 }
             } else {

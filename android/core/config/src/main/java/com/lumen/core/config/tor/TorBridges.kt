@@ -16,6 +16,21 @@ object TorBridges {
     /** Built-in subscription that lists every bridge, one `tor://` link per line. */
     const val SUBSCRIPTION_URL = "https://raw.githubusercontent.com/UCIRANX/UC-Plus/bridges/tor.txt"
 
+    /** Folder of the bridges branch that the workflow publishes. */
+    private const val BRANCH_URL = "https://raw.githubusercontent.com/UCIRANX/UC-Plus/bridges/"
+
+    /** `FINGERPRINT CC` per bridge: the country each bridge's address is in, from the GeoIP ranges. */
+    const val COUNTRIES_URL = BRANCH_URL + "tor-countries.txt"
+
+    /** Per-country GeoIP files, `<cc>.geoip` and `<cc>.geoip6`, given to Tor as its exit database. */
+    const val GEO_URL = BRANCH_URL + "geo/"
+
+    /** The 40-hex identity fingerprint of a bridge line, in upper case, or null when it has none. */
+    fun fingerprint(line: String): String? =
+        FINGERPRINT.find(normalize(line))?.value?.uppercase(java.util.Locale.ROOT)
+
+    private val FINGERPRINT = Regex("(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])")
+
     /** Every transport a bridge list can contain. */
     val TYPES = listOf("webtunnel", "obfs4", "snowflake", "meek_lite", "vanilla")
 

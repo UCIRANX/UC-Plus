@@ -38,7 +38,14 @@ object TorSidecar {
     private val bootstrapRe = Regex("Bootstrapped (\\d+)%")
 
     /** One bridge to try. */
-    data class Candidate(val transport: String, val line: String, val exit: String = "")
+    /** [exit] is the country the exit relay must be in; [geoip] and [geoip6] are its GeoIP files. */
+    data class Candidate(
+        val transport: String,
+        val line: String,
+        val exit: String = "",
+        val geoip: String = "",
+        val geoip6: String = "",
+    )
 
     /** The instance that connected: its SOCKS port is where the VPN sends traffic. */
     class Winner(val port: Int, val transport: String, val line: String)
@@ -132,6 +139,8 @@ object TorSidecar {
                 .put("log", log.absolutePath)
                 .put("bridges", JSONArray().put(cand.line))
                 .put("exit_country", cand.exit)
+                .put("geoip_file", cand.geoip)
+                .put("geoip6_file", cand.geoip6)
             TorRunnerService.start(context, slot, cfg.toString())
             result = waitForCircuit(context, slot, port, cand, log)
         } catch (c: CancellationException) {
