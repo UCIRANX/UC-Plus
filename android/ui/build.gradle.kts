@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.lumen.ui"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26

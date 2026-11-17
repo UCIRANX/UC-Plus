@@ -54,7 +54,7 @@ val abiVersionCodeOffsets = mapOf(
 
 android {
     namespace = "net.kramb.lumen"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "uc.plus.com"

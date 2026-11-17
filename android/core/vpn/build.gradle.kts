@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.lumen.core.vpn"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         minSdk = 26
