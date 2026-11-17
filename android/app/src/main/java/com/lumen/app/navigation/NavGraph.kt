@@ -1640,20 +1640,27 @@ fun LumenApp(
                                 )
                             }
                         },
-                        torCountries = { actions ->
+                        torCountries = { actions, includeAny ->
                             val rows = torCountryCounts.map { (code, count) ->
                                 val best = torServersByCountry[code].orEmpty()
                                     .mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }
                                     .minOrNull()
                                 TorCountryRow(code, TorCountries.name(code, torLocale), count,
                                     code in torFavoriteCountries, best)
-                            }.sortedWith(compareByDescending<TorCountryRow> { it.favorite }.thenBy { it.name })
+                            }.sortedWith(
+                                compareByDescending<TorCountryRow> { it.favorite }
+                                    .thenBy { it.pingMs ?: Int.MAX_VALUE }
+                                    .thenBy { it.name }
+                            )
                             torCountryList(
                                 rows = rows,
                                 selectedCountry = torHighlight,
                                 totalCount = torCountryCounts.values.sum(),
                                 anyLabel = torStrings.torAnyCountry,
+                                bridgeLabel = if (torBridgeType == "auto") torStrings.torTypeAuto
+                                    else TorBridges.label(torBridgeType),
                                 emptyText = torStrings.torNoCountries,
+                                includeAny = includeAny,
                                 expandedCode = torExpandedCode,
                                 serversOf = { code -> torServersByCountry[code].orEmpty() },
                                 actions = actions,

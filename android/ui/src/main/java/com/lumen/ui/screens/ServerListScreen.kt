@@ -175,7 +175,7 @@ fun ServerListScreen(
     onSelectedGroupFilter: (String) -> Unit = {},
     torControls: @Composable (String) -> Unit = {},
     // Tor only: the country list shown instead of the rows. It gets a callback that shows every server.
-    torCountries: (LazyListScope.(TorServerActions) -> Unit)? = null,
+    torCountries: (LazyListScope.(TorServerActions, Boolean) -> Unit)? = null,
     disabledProtocols: Set<String> = emptySet(),
     onProtocolEnabledChange: (String, Boolean) -> Unit = { _, _ -> }
 ) {
@@ -370,9 +370,8 @@ fun ServerListScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 if (torCountryMode) {
-                    torCountries?.invoke(this, torActions)
+                    torCountries?.invoke(this, torActions, true)
                 } else {
-                if (torBlockShown) torCountries?.invoke(this, torActions)
                 if (torCountries != null && protocol.equals("tor", ignoreCase = true)) {
                     item(key = "tor_back_to_countries", contentType = "tor_button") {
                         TextButton(onClick = { torShowServers = false }) { Text(strings.torBackToCountries) }
@@ -539,9 +538,16 @@ fun ServerListScreen(
                         }
                     }
                 }
-                val sections = if (groupByCountry) listedNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }
-                    else mapOf("" to listedNodes)
-                sections.forEach { (country, sectionNodes) ->
+                // Without grouping, the Tor countries go right after the last SSTP row (or at the end
+                // when there is none). Grouped by country, they go at the end.
+                val lastSstp = listedNodes.indexOfLast { protocolKey(it) == "sstp" }
+                val splitAt = if (lastSstp < 0) listedNodes.size else lastSstp + 1
+                val sections: List<Pair<String, List<NodeUiModel>>> = if (groupByCountry) {
+                    listedNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }.map { it.key to it.value }
+                } else listOf("" to listedNodes.take(splitAt), "" to listedNodes.drop(splitAt))
+                val torSlot = if (groupByCountry) sections.size else 1
+                sections.forEachIndexed { index, (country, sectionNodes) ->
+                    if (torBlockShown && index == torSlot) torCountries?.invoke(this, torActions, false)
                     if (country.isNotBlank()) item(key = "country:$country", contentType = "country") {
                         Text("${CountryFlagHelper.getFlagEmoji(country)}  $country · ${sectionNodes.size}",
                             Modifier.padding(horizontal = 8.dp, vertical = 10.dp), style = MaterialTheme.typography.labelLarge)
@@ -582,6 +588,7 @@ fun ServerListScreen(
                 }
 
                 }
+                if (torBlockShown && torSlot >= sections.size) torCountries?.invoke(this, torActions, false)
                 item(key = "server_footer", contentType = "spacer") {
                     Spacer(modifier = Modifier.height(16.dp))
                 }

@@ -20,6 +20,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.graphics.Color
+import com.lumen.ui.components.CountryFlagHelper
+import com.lumen.ui.theme.LumenMono
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -92,16 +99,19 @@ data class TorServerActions(
 )
 
 /**
- * The Tor country list. Tapping a country name selects it; its arrow opens the servers of that
- * country underneath. [selectedCountry] is null when no Tor choice is the active config, and ""
- * for "any country".
+ * The Tor country list, drawn like the other servers: flag badge, country name, then a subtitle
+ * "Tor - bridge type - ping - servers". The heart keeps its place; the arrow sits after it and opens
+ * the servers of that country. [selectedCountry] is null when no Tor choice is the active config, and
+ * "" for "any country". [includeAny] is false in the all-protocols list.
  */
 fun LazyListScope.torCountryList(
     rows: List<TorCountryRow>,
     selectedCountry: String?,
     totalCount: Int,
     anyLabel: String,
+    bridgeLabel: String,
     emptyText: String,
+    includeAny: Boolean,
     expandedCode: String,
     serversOf: (String) -> List<NodeUiModel>,
     actions: TorServerActions,
@@ -109,10 +119,11 @@ fun LazyListScope.torCountryList(
     onToggleExpand: (String) -> Unit,
     onFavorite: (String) -> Unit,
 ) {
-    item(key = "tor_any_country", contentType = "tor_country") {
+    if (includeAny) item(key = "tor_any_country", contentType = "tor_country") {
         TorCountryItem(
-            flag = "",
+            flag = "🌐",
             name = anyLabel,
+            subtitle = "Tor - $bridgeLabel",
             count = totalCount,
             ping = null,
             selected = selectedCountry == "",
@@ -137,10 +148,11 @@ fun LazyListScope.torCountryList(
         val isExpanded = expandedCode.equals(row.code, ignoreCase = true)
         item(key = "tor_country:${row.code}", contentType = "tor_country") {
             TorCountryItem(
-                flag = flagOf(row.code),
+                flag = CountryFlagHelper.getServerFlagEmoji(row.code),
                 name = row.name,
+                subtitle = "Tor - $bridgeLabel",
                 count = row.count,
-                ping = row.pingMs?.let { "$it ms" } ?: "--",
+                ping = row.pingMs,
                 selected = selectedCountry.equals(row.code, ignoreCase = true),
                 favorite = row.favorite,
                 expanded = isExpanded,
@@ -170,8 +182,9 @@ fun LazyListScope.torCountryList(
 private fun TorCountryItem(
     flag: String,
     name: String,
+    subtitle: String,
     count: Int,
-    ping: String?,
+    ping: Int?,
     selected: Boolean,
     favorite: Boolean?,
     expanded: Boolean?,
@@ -179,46 +192,63 @@ private fun TorCountryItem(
     onToggleExpand: () -> Unit,
     onFavorite: () -> Unit,
 ) {
-    val background = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer
+    val art = com.lumen.ui.theme.expressivePalette()
+    val bg = if (selected) art.stage else MaterialTheme.colorScheme.surfaceContainerLow
+    val textPrimary = if (selected) art.onStage else MaterialTheme.colorScheme.onSurface
+    val textMuted = textPrimary.copy(alpha = .75f)
+    val pingText = when {
+        ping != null && ping > 0 -> "$ping ms"
+        ping != null -> "--"
+        else -> "--"
+    }
+    val pingTint = if (ping != null && ping > 0) pingColor(ping, bg) else textMuted
     Row(
         Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(background)
-            .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+            .clip(RoundedCornerShape(14.dp))
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            if (flag.isEmpty()) name else "$flag  $name",
+        Box(
             Modifier
-                .weight(1f)
-                .clickable(onClick = onClick)
-                .padding(vertical = 10.dp),
-            style = MaterialTheme.typography.bodyLarge,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        if (ping != null) {
+                .size(34.dp)
+                .clip(RoundedCornerShape(topStart = 6.dp, topEnd = 18.dp, bottomEnd = 6.dp, bottomStart = 18.dp))
+                .background(if (selected) art.lime else MaterialTheme.colorScheme.background),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(flag, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
             Text(
-                ping,
-                Modifier.padding(horizontal = 4.dp),
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                name,
+                fontSize = 15.sp,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold,
+                color = textPrimary,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                buildAnnotatedString {
+                    append("$subtitle - ")
+                    withStyle(SpanStyle(color = pingTint, fontFamily = LumenMono)) { append(pingText) }
+                    append(" - $count")
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = textMuted,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
             )
         }
-        Text(
-            "$count",
-            Modifier.padding(horizontal = 6.dp),
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
         if (favorite != null) {
             IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
                 Icon(
                     if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                     contentDescription = null,
-                    tint = if (favorite) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = if (favorite) MaterialTheme.colorScheme.error else textMuted,
                 )
             }
         }
@@ -227,7 +257,7 @@ private fun TorCountryItem(
                 Icon(
                     if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = textMuted,
                 )
             }
         }
