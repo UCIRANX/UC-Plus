@@ -171,7 +171,8 @@ fun ServerListScreen(
     persistPreferences: Boolean = true,
     compactGrid: Boolean = false,
     selectedGroupFilter: String? = null,
-    onSelectedGroupFilter: (String) -> Unit = {}
+    onSelectedGroupFilter: (String) -> Unit = {},
+    torControls: @Composable (String) -> Unit = {}
 ) {
     val lumenColors = LocalLumenColors.current
     val art = com.lumen.ui.theme.expressivePalette()
@@ -331,6 +332,9 @@ fun ServerListScreen(
                 noPingCount = nodes.count { it.pingMs == 0 && !it.isFavorite },
                 onRemoveNoPing = onRemoveNoPingServers,
                 trailing = listToolbar)
+
+            // Tor-only controls (exit country, bridge type, automatic connect) appear under the filter bar.
+            torControls(protocol)
 
             // 5. Server List
             LazyColumn(

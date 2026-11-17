@@ -422,6 +422,11 @@ import com.lumen.ui.screens.ImportPhaseUi
 
 
 import com.lumen.ui.screens.LocalStrings
+import com.lumen.ui.screens.TorControlsCard
+import com.lumen.ui.screens.TorCountryChoice
+import com.lumen.core.config.tor.TorBridges
+import com.lumen.core.config.tor.TorCountries
+import com.lumen.ui.components.ConnectionState
 
 
 
@@ -1601,8 +1606,33 @@ fun LumenApp(
 
 
 
+                    val torExitCountry by viewModel.torExitCountry.collectAsStateWithLifecycle()
+                    val torBridgeType by viewModel.torBridgeType.collectAsStateWithLifecycle()
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
+                        torControls = { protocol ->
+                            if (protocol.equals("tor", ignoreCase = true)) {
+                                val strings = LocalStrings.current
+                                val locale = java.util.Locale.forLanguageTag(strings.localeCode)
+                                TorControlsCard(
+                                    exitCountry = torExitCountry,
+                                    countries = TorCountries.CODES.map { code ->
+                                        TorCountryChoice(code, TorCountries.name(code, locale))
+                                    },
+                                    onExitCountry = viewModel::setTorExitCountry,
+                                    bridgeType = torBridgeType,
+                                    types = listOf("auto" to strings.torTypeAuto) +
+                                        TorBridges.TYPES.map { it to TorBridges.label(it) },
+                                    onBridgeType = viewModel::setTorBridgeType,
+                                    autoConnectEnabled = serversConnectionState != ConnectionState.Connected &&
+                                        serversConnectionState != ConnectionState.Connecting,
+                                    onAutoConnect = {
+                                        viewModel.setTorAutoMode(true)
+                                        onToggleConnection()
+                                    },
+                                )
+                            }
+                        },
                         compactGrid = settings.compactServerGrid,
                         selectedGroupFilter = selectedServerFilter,
                         onSelectedGroupFilter = viewModel::selectServerFilter,

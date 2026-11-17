@@ -46,8 +46,11 @@ import com.lumen.core.vpn.VpnLogLevel
 import com.lumen.core.vpn.VpnLogSettings
 import com.lumen.core.vpn.VpnStartIntentFactory
 import com.lumen.core.vpn.VpnStartParams
+import com.lumen.core.vpn.tor.TorPrefs
 import com.lumen.core.vpn.tor.TorSidecar
 import com.lumen.core.config.tor.TorBridges
+import com.lumen.core.config.tor.TorCountries
+import com.lumen.core.config.tor.TorPlanner
 import com.lumen.ui.components.ConnectionState
 import com.lumen.ui.components.CountryFlagHelper
 import com.lumen.ui.screens.AppEntryUiModel
@@ -79,6 +82,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -1594,6 +1598,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun selectNode(node: NodeUiModel) {
         if (_selectedNodeId.value != node.id) resetConnectedPing()
         persistSelectedNodeIdentity(node.id, node.name)
+        // Choosing one Tor server means "use this one"; the auto button turns the pool back on.
+        if (node.protocol.equals("tor", ignoreCase = true) && torPrefs.autoMode) {
+            torPrefs.autoMode = false
+            _torAuto.value = false
+        }
         scheduleStoredVpnConfigRefresh()
         log("Selected ${node.name}")
     }
@@ -3810,7 +3819,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val selectedIsTor = nodeEntities.value.firstOrNull { it.id == _selectedNodeId.value }
             ?.protocol.equals("tor", ignoreCase = true)
         connectTimeoutJob = viewModelScope.launch {
-            delay(if (selectedIsTor) 300_000L else 45_000L)
+            // Tor may try several bridges, each with a long bootstrap, before one connects.
+            delay(if (selectedIsTor) 540_000L else 45_000L)
             if (!LumenVpnService.isRunning.value &&
                 _connectionState.value == ConnectionState.Connecting
             ) {
@@ -4190,13 +4200,59 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .put("socks_port", socksPort)).toString()
     }
 
-    /** Tor nodes: the VPN service starts Tor with this bridge line before the core runs. */
+    /**
+     * Tor nodes: the VPN service starts Tor before the core runs. In automatic mode it races the
+     * bridges of the chosen type (or all types); for one chosen server it uses only that bridge.
+     */
     private fun withTorSidecar(parsed: ParsedNode, configJson: String): String {
         if (!parsed.scheme.equals("tor", ignoreCase = true)) return configJson
         val line = TorBridges.decode(parsed.link) ?: return configJson
+        val prefs = torPrefs
+        val ordered = if (prefs.autoMode) {
+            val pool = nodeEntities.value
+                .filter { it.protocol.equals("tor", ignoreCase = true) }
+                .mapNotNull { TorBridges.decode(it.link) }
+            val types = prefs.bridgeType.takeIf { it != "auto" }?.let { setOf(it) }
+            TorPlanner.order(pool, prefs.lastGoodLine, types).ifEmpty { listOf(line) }
+        } else {
+            listOf(line)
+        }
+        val candidates = org.json.JSONArray()
+        for (l in ordered) {
+            candidates.put(org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l))
+        }
         return org.json.JSONObject(configJson).put("_lumen_tor", org.json.JSONObject()
-            .put("transport", TorBridges.typeOf(line))
-            .put("line", line)).toString()
+            .put("exitCountry", TorCountries.normalize(prefs.exitCountry))
+            .put("candidates", candidates)).toString()
+    }
+
+    /** Tor exit country, bridge type and automatic mode, as the Tor controls show them. */
+    private val torPrefs: TorPrefs = TorPrefs(getApplication<Application>())
+    private val _torExitCountry = MutableStateFlow(torPrefs.exitCountry)
+    val torExitCountry: StateFlow<String> = _torExitCountry.asStateFlow()
+    private val _torBridgeType = MutableStateFlow(torPrefs.bridgeType)
+    val torBridgeType: StateFlow<String> = _torBridgeType.asStateFlow()
+    private val _torAuto = MutableStateFlow(torPrefs.autoMode)
+    val torAuto: StateFlow<Boolean> = _torAuto.asStateFlow()
+
+    fun setTorExitCountry(code: String) {
+        val c = TorCountries.normalize(code)
+        torPrefs.exitCountry = c
+        _torExitCountry.value = c
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    fun setTorBridgeType(type: String) {
+        torPrefs.bridgeType = type
+        _torBridgeType.value = type
+        scheduleStoredVpnConfigRefresh()
+    }
+
+    /** On: Tor picks bridges from the pool. Off: the selected server is used alone. */
+    fun setTorAutoMode(on: Boolean) {
+        torPrefs.autoMode = on
+        _torAuto.value = on
+        scheduleStoredVpnConfigRefresh()
     }
 
     private fun freeLoopbackPort(): Int =

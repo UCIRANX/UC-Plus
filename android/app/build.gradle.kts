@@ -149,6 +149,82 @@ tasks.matching { it.name.startsWith("validateSigning") || it.name.startsWith("pa
     dependsOn(ensureReleaseKeystore)
 }
 
+// Tor's GeoIP files (geoip, geoip6) map relay addresses to countries. They are needed to pick
+// an exit country. They come from the Tor source at build time and are bundled as assets.
+val downloadGeoip by tasks.registering {
+    doLast {
+        val dir = file("src/main/assets/geoip").apply { mkdirs() }
+        val repoPaths = listOf(
+            "https://raw.githubusercontent.com/torproject/tor/main/src/config/%s",
+            "https://github.com/torproject/tor/raw/main/src/config/%s",
+            "https://gitlab.torproject.org/tpo/core/tor/-/raw/main/src/config/%s",
+            "https://gitlab.torproject.org/tpo/core/tor/-/raw/release-0.4.8/src/config/%s",
+            "https://raw.githubusercontent.com/torproject/tor/release-0.4.8/src/config/%s",
+            "https://raw.githubusercontent.com/torproject/tor/release-0.4.7/src/config/%s",
+            "https://cdn.jsdelivr.net/gh/torproject/tor@main/src/config/%s",
+            "https://raw.githubusercontent.com/torproject/tor/release-0.4.5/src/config/%s",
+        )
+        // Each line is "start,end,country" (addresses are numbers or text); check the shape only.
+        val line = Regex("^[^,#\\s]+,[^,\\s]+,[A-Za-z?]{2}$")
+        fun check(f: File, v6: Boolean): String? {
+            if (!f.exists()) return "file was not created"
+            val min = if (v6) 50_000L else 200_000L
+            if (f.length() < min) return "size is only ${f.length()} bytes"
+            val ok = f.useLines { ls -> ls.take(5000).any { line.matches(it.trim()) } }
+            if (!ok) return "unexpected format"
+            return null
+        }
+        val problems = mutableListOf<String>()
+        var missing = false
+        for (name in listOf("geoip", "geoip6")) {
+            val v6 = name == "geoip6"
+            val dest = File(dir, name)
+            if (check(dest, v6) == null) {
+                println("[UC-GEOIP] $name already present (${dest.length()} bytes)")
+                continue
+            }
+            var done = false
+            loop@ for (round in 1..2) for (pattern in repoPaths) {
+                val u = pattern.format(name)
+                val tmp = File(dir, "$name.part")
+                try {
+                    val c = java.net.URI(u).toURL().openConnection() as java.net.HttpURLConnection
+                    c.connectTimeout = 20_000
+                    c.readTimeout = 90_000
+                    c.instanceFollowRedirects = true
+                    c.setRequestProperty("User-Agent", "Mozilla/5.0 uc-plus-build")
+                    if (c.responseCode !in 200..299) {
+                        println("[UC-GEOIP] $u -> HTTP ${c.responseCode}")
+                        if (round == 2) problems += "$name: HTTP ${c.responseCode}"
+                        continue
+                    }
+                    c.inputStream.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+                    val why = check(tmp, v6)
+                    if (why == null) {
+                        dest.delete()
+                        tmp.renameTo(dest)
+                        println("[UC-GEOIP] $name downloaded (${dest.length()} bytes) from $u")
+                        done = true
+                        break@loop
+                    }
+                    println("[UC-GEOIP] $u rejected: $why")
+                    tmp.delete()
+                    if (round == 2) problems += "$name: $why"
+                } catch (e: Exception) {
+                    println("[UC-GEOIP] $u failed: ${e.javaClass.simpleName}: ${e.message}")
+                    if (round == 2) problems += "$name: ${e.javaClass.simpleName}"
+                }
+            }
+            if (!done && !v6) missing = true
+        }
+        if (missing) {
+            println("::warning::[UC-GEOIP] geoip could not be downloaded; choosing an exit country will not work. " +
+                problems.take(6).joinToString(" ; "))
+        }
+    }
+}
+tasks.named("preBuild") { dependsOn(downloadGeoip) }
+
 androidComponents {
     onVariants { variant ->
         variant.outputs.forEach { output ->

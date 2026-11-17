@@ -71,3 +71,6 @@ object TorBridges {
         return line.takeIf { isBridgeLine(it) && hostPort(it) != null }
     }
 }
+
+/** SOCKS port of the Tor instance in parallel slot [slot] (0 is the first instance). */
+fun torSlotPort(slot: Int): Int = TorBridges.SOCKS_PORT + slot

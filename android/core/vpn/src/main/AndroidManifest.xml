@@ -14,6 +14,17 @@
             android:exported="false"
             android:process=":tor" />
 
+        <!-- Parallel Tor instances (slots 1 and 2), each in its own process. -->
+        <service
+            android:name=".tor.TorRunnerService1"
+            android:exported="false"
+            android:process=":tor1" />
+
+        <service
+            android:name=".tor.TorRunnerService2"
+            android:exported="false"
+            android:process=":tor2" />
+
         <service
             android:name="org.torproject.jni.TorService"
             android:process=":tor"

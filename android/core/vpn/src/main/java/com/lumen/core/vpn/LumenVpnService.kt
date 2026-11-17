@@ -549,11 +549,37 @@ ${hevAuthLines}misc:
         val tor = runtime.optJSONObject("_lumen_tor")
         runtime.remove("_lumen_tor")
         if (tor != null) {
-            com.lumen.core.vpn.tor.TorSidecar.start(
+            val list = tor.optJSONArray("candidates")
+            val candidates = if (list != null) {
+                (0 until list.length()).map { i ->
+                    list.getJSONObject(i).let { c ->
+                        com.lumen.core.vpn.tor.TorSidecar.Candidate(c.optString("transport"), c.getString("line"))
+                    }
+                }
+            } else {
+                // Configs saved before parallel connections hold one bridge.
+                listOf(com.lumen.core.vpn.tor.TorSidecar.Candidate(
+                    tor.optString("transport"), tor.getString("line")))
+            }
+            val winner = com.lumen.core.vpn.tor.TorSidecar.connect(
                 applicationContext,
-                line = tor.getString("line"),
-                transport = tor.optString("transport")
+                candidates = candidates,
+                exitCountry = tor.optString("exitCountry")
             )
+            // Remembered so the next automatic connection tries this bridge first.
+            com.lumen.core.vpn.tor.TorPrefs(applicationContext).lastGoodLine = winner.line
+            // The core dials the Tor port that actually connected, which may not be the default one.
+            runtime.optJSONArray("outbounds")?.let { outbounds ->
+                for (i in 0 until outbounds.length()) {
+                    val outbound = outbounds.getJSONObject(i)
+                    if (outbound.optString("type") == "socks" &&
+                        outbound.optString("server") == "127.0.0.1" &&
+                        outbound.optInt("server_port") == com.lumen.core.config.tor.TorBridges.SOCKS_PORT
+                    ) {
+                        outbound.put("server_port", winner.port)
+                    }
+                }
+            }
         }
         runtime.optJSONObject("_lumen_xray")?.let { sidecar ->
             // A persisted tile/widget config may hold ports used by another app now.

@@ -20,6 +20,13 @@ private fun russianPlural(count: Int, one: String, few: String, many: String): S
 class LumenStrings {
     /** Name of the built-in group that holds the Tor bridges. */
     var torGroupName = "Tor"
+    var torExitLabel = "Exit country"
+    var torAnyCountry = "Any country"
+    var torTypeLabel = "Bridge type"
+    var torTypeAuto = "Auto"
+    var torAutoConnect = "Auto connect"
+    var torGeoMissing = "GeoIP files are missing in this build; exit country is unavailable."
+    var torAutoHint = "Tries the bridges of the chosen type in parallel and connects to the first that works."
     var dashboardStyleDock = "Dock control"
     var resetLumen = "Reset UC Plus"; var resetSettings = "Reset settings"; var resetServers = "Delete servers"
     var resetSettingsHint = "Restore preferences. Servers and subscriptions stay."
@@ -312,6 +319,13 @@ class LumenStrings {
 
 private val EN = LumenStrings().apply {
     torGroupName = "Tor"
+    torExitLabel = "Exit country"
+    torAnyCountry = "Any country"
+    torTypeLabel = "Bridge type"
+    torTypeAuto = "Auto"
+    torAutoConnect = "Auto connect"
+    torGeoMissing = "GeoIP files are missing in this build; exit country is unavailable."
+    torAutoHint = "Tries the bridges of the chosen type in parallel and connects to the first that works."
     localeCode = "en"
     providerMore="More"; providerLess="Less"
     serverGroup="Server group"
@@ -471,6 +485,13 @@ private val EN = LumenStrings().apply {
 
 private val RU = LumenStrings().apply {
     torGroupName = "Тор"
+    torExitLabel = "Страна выхода"
+    torAnyCountry = "Любая страна"
+    torTypeLabel = "Тип моста"
+    torTypeAuto = "Авто"
+    torAutoConnect = "Автоподключение"
+    torGeoMissing = "Файлы GeoIP отсутствуют в этой сборке; страна выхода недоступна."
+    torAutoHint = "Параллельно проверяет мосты выбранного типа и подключается к первому рабочему."
     resetLumen="Сброс UC Plus"; resetSettings="Сброс настроек"; resetServers="Удаление серверов"
     resetSettingsHint="Настройки станут исходными. Серверы и подписки останутся."
     resetServersHint="Все серверы, подписки и группы будут удалены. Настройки останутся."
@@ -704,6 +725,13 @@ private val RU = LumenStrings().apply {
 
 private val ZH = LumenStrings().copyFrom(EN).apply {
     torGroupName = "洋葱路由"
+    torExitLabel = "国家出口"
+    torAnyCountry = "任意国家"
+    torTypeLabel = "网桥类型"
+    torTypeAuto = "自动"
+    torAutoConnect = "自动连接"
+    torGeoMissing = "此版本缺少 GeoIP 文件，无法选择出口国家。"
+    torAutoHint = "并行测试所选类型的网桥，并连接到第一个可用的网桥。"
     resetLumen="重置 UC Plus"; resetSettings="重置设置"; resetServers="删除服务器"
     resetSettingsHint="恢复默认设置，保留服务器和订阅。"; resetServersHint="删除所有服务器、订阅和分组，保留设置。"
     resetWarning="连接将停止。此操作无法撤销。"; resetAction="重置"; resetComplete="重置完成"
@@ -932,6 +960,13 @@ private val ZH = LumenStrings().copyFrom(EN).apply {
 
 private val FA = LumenStrings().apply {
     torGroupName = "تور"
+    torExitLabel = "کشور خروجی"
+    torAnyCountry = "هر کشوری"
+    torTypeLabel = "نوع بریج"
+    torTypeAuto = "خودکار"
+    torAutoConnect = "اتصال خودکار"
+    torGeoMissing = "فایل‌های GeoIP در این نسخه نیست؛ انتخاب کشور خروجی ممکن نیست."
+    torAutoHint = "بریج‌های نوع انتخاب‌شده را همزمان امتحان می‌کند و به اولین بریج سالم وصل می‌شود."
     resetLumen="بازنشانی UC Plus"; resetSettings="بازنشانی تنظیمات"; resetServers="حذف سرورها"
     resetSettingsHint="تنظیمات پیش‌فرض می‌شوند. سرورها و اشتراک‌ها حفظ می‌شوند."
     resetServersHint="همه سرورها، اشتراک‌ها و گروه‌ها حذف می‌شوند. تنظیمات حفظ می‌شوند."
