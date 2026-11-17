@@ -46,6 +46,8 @@ import com.lumen.core.vpn.VpnLogLevel
 import com.lumen.core.vpn.VpnLogSettings
 import com.lumen.core.vpn.VpnStartIntentFactory
 import com.lumen.core.vpn.VpnStartParams
+import com.lumen.core.vpn.tor.TorSidecar
+import com.lumen.core.config.tor.TorBridges
 import com.lumen.ui.components.ConnectionState
 import com.lumen.ui.components.CountryFlagHelper
 import com.lumen.ui.screens.AppEntryUiModel
@@ -2287,14 +2289,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         "Uciran" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciran.txt",
         "Uciranir" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciranir.txt",
         "UcOvpn" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UcOvpn.txt",
-        "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt"
+        "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt",
+        // Tor bridges collected by the workflow; one tor:// server per bridge.
+        "Tor" to TorBridges.SUBSCRIPTION_URL
     )
 
     /** Inserts every built-in subscription whose URL is not stored yet; returns how many were added. */
     private suspend fun addMissingBuiltInSubscriptions(): Int = subscriptionMutations.withLock {
         val known = subscriptionDao.getSubscriptions().first().map { it.url }.toSet()
         val missing = builtInSubscriptions.filter { (_, url) -> url !in known }
-        missing.forEach { (name, url) -> subscriptionDao.insertSubscription(SubscriptionEntity(name = name, url = url)) }
+        missing.forEach { (name, url) ->
+            val shownName = if (url == TorBridges.SUBSCRIPTION_URL) {
+                com.lumen.ui.screens.stringsForLanguage(_settings.value.language).torGroupName
+            } else name
+            subscriptionDao.insertSubscription(SubscriptionEntity(name = shownName, url = url))
+        }
         missing.size
     }
 
@@ -3050,7 +3059,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun measureNodePing(entity: NodeEntity): Int {
         // The SOCKS detour only exists while the SSTP bridge runs, so probe the server directly.
-        if (entity.protocol.equals("sstp", ignoreCase = true)) return tcpPing(entity.server, entity.port)
+        if (entity.protocol.equals("sstp", ignoreCase = true) || entity.protocol.equals("tor", ignoreCase = true)) {
+            return tcpPing(entity.server, entity.port)
+        }
         if (entity.link.startsWith(ProtectedProfileCodec.PREFIX)) {
             val resolved = parseEntity(entity)
             return proxyPingAttempts(resolved)
@@ -3769,6 +3780,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var connectTimeoutJob: kotlinx.coroutines.Job? = null
 
+    /** Tor bootstrap percent while a Tor server is connecting; null otherwise. */
+    val connectProgress: StateFlow<Int?> = TorSidecar.progress
+        .map { if (it >= 0) it else null }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     /**
      * Why the last start attempt produced no tunnel. The navigator shows it: a config
      * that cannot be built for a 300 member AUTO pool has to say so, not fail silently.
@@ -3790,8 +3806,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         _connectionState.value = ConnectionState.Connecting
         // Repeated taps must not stack watchdogs racing to flip the state to Error.
         connectTimeoutJob?.cancel()
+        // Tor bootstraps through a bridge, which can take minutes; other servers keep 45 s.
+        val selectedIsTor = nodeEntities.value.firstOrNull { it.id == _selectedNodeId.value }
+            ?.protocol.equals("tor", ignoreCase = true)
         connectTimeoutJob = viewModelScope.launch {
-            delay(45_000)
+            delay(if (selectedIsTor) 300_000L else 45_000L)
             if (!LumenVpnService.isRunning.value &&
                 _connectionState.value == ConnectionState.Connecting
             ) {
@@ -4042,7 +4061,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         put(com.lumen.core.vpn.ProfilePolicyEnforcer.CONFIG_KEY, policy.toJson()
                             .put("storeHash", selected.link.removePrefix(ProtectedProfileCodec.PREFIX + "store/").substringBefore('/')))
                     }
-                }.toString() else withSstpSidecar(parsedSelected, configJson),
+                }.toString() else withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson)),
             engineType = "SINGBOX",
             splitMode = _splitMode.value.name,
             splitPackages = _splitPackages.value,
@@ -4169,6 +4188,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .put("password", params.password)
             .put("relay_port", relayPort)
             .put("socks_port", socksPort)).toString()
+    }
+
+    /** Tor nodes: the VPN service starts Tor with this bridge line before the core runs. */
+    private fun withTorSidecar(parsed: ParsedNode, configJson: String): String {
+        if (!parsed.scheme.equals("tor", ignoreCase = true)) return configJson
+        val line = TorBridges.decode(parsed.link) ?: return configJson
+        return org.json.JSONObject(configJson).put("_lumen_tor", org.json.JSONObject()
+            .put("transport", TorBridges.typeOf(line))
+            .put("line", line)).toString()
     }
 
     private fun freeLoopbackPort(): Int =

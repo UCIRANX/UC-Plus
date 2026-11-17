@@ -20,7 +20,7 @@ internal object ImportClassifier {
         "vless", "vmess", "ss", "shadowsocks", "trojan", "tuic", "hysteria2", "hy2",
         "hysteria", "hy", "wireguard", "wg", "awg", "amneziawg", "warp",
         "naive", "naive+https", "naive+quic", "quic", "mieru", "mierus", "masque",
-        "anytls", "sstp", "socks", "socks5", "http", "https"
+        "anytls", "sstp", "tor", "socks", "socks5", "http", "https"
     )
 
     fun classify(raw: String?): ImportClassification {

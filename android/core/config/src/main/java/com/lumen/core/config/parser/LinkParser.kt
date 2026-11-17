@@ -527,6 +527,7 @@ object LinkParser {
             "masque" -> parseMasque(text)
             "anytls" -> parseAnyTls(text)
             "sstp" -> parseSstp(text)
+            "tor" -> parseTor(text)
             else -> throw LinkParseError("Unsupported scheme: ${if (scheme.isEmpty()) "unknown" else scheme}")
         }
     }
@@ -1440,6 +1441,24 @@ object LinkParser {
     private fun parseSstp(link: String): ParsedNode {
         val params = SstpLink.parse(link) ?: throw LinkParseError("Invalid SSTP link")
         return sstpNode(params.host, params.port, params.username, params.password, params.countryCode)
+    }
+
+    /** One Tor bridge line. The VPN service starts Tor with it; sing-box uses Tor's SOCKS port. */
+    private fun parseTor(link: String): ParsedNode {
+        val line = com.lumen.core.config.tor.TorBridges.decode(link) ?: throw LinkParseError("Invalid Tor bridge link")
+        val (host, port) = com.lumen.core.config.tor.TorBridges.hostPort(line)
+            ?: throw LinkParseError("Tor bridge has no address")
+        val outbound = mapOf<String, Any?>(
+            "protocol" to "socks",
+            "settings" to mapOf("servers" to listOf(mapOf("address" to "127.0.0.1",
+                "port" to com.lumen.core.config.tor.TorBridges.SOCKS_PORT)))
+        )
+        val type = com.lumen.core.config.tor.TorBridges.typeOf(line)
+        return ParsedNode(
+            name = com.lumen.core.config.tor.TorBridges.displayName(type, host), scheme = "tor",
+            server = host, port = port,
+            link = com.lumen.core.config.tor.TorBridges.encode(line), outbound = outbound,
+        )
     }
 
     private fun parseSocks(link: String): ParsedNode {

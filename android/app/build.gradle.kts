@@ -132,6 +132,8 @@ android {
         }
         jniLibs {
             useLegacyPackaging = true
+            // Tor and the transports ship their own copy of libc++; one is enough.
+            pickFirsts += setOf("**/libc++_shared.so")
         }
     }
 }

@@ -545,6 +545,16 @@ ${hevAuthLines}misc:
                 socksPort = sstp.getInt("socks_port")
             )
         }
+        // Tor nodes: Tor must have bootstrapped before the core dials its SOCKS port.
+        val tor = runtime.optJSONObject("_lumen_tor")
+        runtime.remove("_lumen_tor")
+        if (tor != null) {
+            com.lumen.core.vpn.tor.TorSidecar.start(
+                applicationContext,
+                line = tor.getString("line"),
+                transport = tor.optString("transport")
+            )
+        }
         runtime.optJSONObject("_lumen_xray")?.let { sidecar ->
             // A persisted tile/widget config may hold ports used by another app now.
             val inbounds = sidecar.getJSONArray("inbounds")
@@ -1307,6 +1317,7 @@ ${hevAuthLines}misc:
         xraySidecar = null
         sstpSidecar?.stop()
         sstpSidecar = null
+        com.lumen.core.vpn.tor.TorSidecar.stop(applicationContext)
         if (closeInterface) {
             runCatching { vpnInterface?.close() }
             vpnInterface = null

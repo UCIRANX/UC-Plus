@@ -30,6 +30,11 @@ dependencies {
     implementation(project(":core:engine"))
     implementation(project(":core:config"))
 
+    // Tor (C tor from Guardian Project) and its pluggable transports (Lyrebird, Snowflake)
+    implementation("info.guardianproject:tor-android:0.4.9.6")
+    implementation("info.guardianproject:jtorctl:0.4.5.7")
+    implementation("com.netzarchitekten:IPtProxy:5.7.0")
+
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

@@ -1416,11 +1416,13 @@ fun LumenApp(
                 val lumenColors = LocalLumenColors.current
                 val dockPingProgress by viewModel.bulkPingProgress.collectAsStateWithLifecycle()
                 val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+                val connectProgress by viewModel.connectProgress.collectAsStateWithLifecycle()
 
                 com.lumen.ui.components.BottomConnectionControls(
                         showSlider = false,
                         dockVisible = dockConnection || dockVisible, connectionState = connectionState,
                         dockConnection = dockConnection,
+                        connectProgress = connectProgress,
                         dockScalePercent = settings.dockScalePercent,
                         onDockHeightChanged = { dockHeight = it },
                         onToggleConnection = onToggleConnection,

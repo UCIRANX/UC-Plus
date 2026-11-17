@@ -2096,6 +2096,12 @@ object SingboxConfigBuilder {
                 result["server"] = "127.0.0.1"
                 result["server_port"] = com.lumen.core.config.parser.SstpLink.SOCKS_PORT
             }
+            "tor" -> {
+                // Tor serves SOCKS5 on loopback once its bridge has bootstrapped.
+                result["type"] = "socks"
+                result["server"] = "127.0.0.1"
+                result["server_port"] = com.lumen.core.config.tor.TorBridges.SOCKS_PORT
+            }
             "socks", "http" -> {
                 result["type"] = scheme
                 result["server"] = node.server

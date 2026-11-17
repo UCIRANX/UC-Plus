@@ -18,7 +18,8 @@ fun BottomConnectionControls(
     showSlider: Boolean, dockVisible: Boolean, connectionState: ConnectionState,
     items: List<DockItem>, activeId: String, onSelect: (String) -> Unit, onToggleConnection: () -> Unit,
     dockConnection: Boolean = false, dockScalePercent: Int = 100,
-    onDockHeightChanged: (androidx.compose.ui.unit.Dp) -> Unit = {}
+    onDockHeightChanged: (androidx.compose.ui.unit.Dp) -> Unit = {},
+    connectProgress: Int? = null,
 ) {
     // One clock keeps the slot, gap and dock layer in phase through reversals.
     val progress = animateFloatAsState(if (dockVisible) 1f else 0f,
@@ -42,7 +43,7 @@ fun BottomConnectionControls(
                         val height = with(density) { size.height.toDp() }
                         if (height != measuredHeight) { measuredHeight = height; onDockHeightChanged(height) }
                     }, visibilityProgress = { progress.value }, scalePercent = dockScalePercent,
-                    trailingAction = if (dockConnection) { { DockConnectionButton(connectionState, onToggleConnection) } } else null)
+                    trailingAction = if (dockConnection) { { DockConnectionButton(connectionState, onToggleConnection, progress = connectProgress) } } else null)
             }
         }
     }

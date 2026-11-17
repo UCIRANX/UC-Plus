@@ -23,6 +23,8 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.font.FontWeight
 import com.lumen.ui.screens.LocalStrings
 import com.lumen.ui.screens.rememberHapticTick
 import com.lumen.ui.theme.expressivePalette
@@ -49,7 +51,13 @@ fun LumenMark(color: Color, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun DockConnectionButton(state: ConnectionState, onToggle: () -> Unit, modifier: Modifier = Modifier) {
+fun DockConnectionButton(
+    state: ConnectionState,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+    /** Tor bootstrap percent; shown inside the button while a Tor server connects. */
+    progress: Int? = null,
+) {
     val s = LocalStrings.current
     val art = expressivePalette()
     val connected = state == ConnectionState.Connected
@@ -77,8 +85,13 @@ fun DockConnectionButton(state: ConnectionState, onToggle: () -> Unit, modifier:
             role = Role.Button, onClick = { tick(HapticFeedbackType.LongPress); onToggle() }), contentAlignment = Alignment.Center) {
         MorphingExpressiveMotif(Motif.Sun, color.value, { morph.value },
             Modifier.matchParentSize().graphicsLayer { rotationZ = angle.value })
-        Icon(Icons.Default.PowerSettingsNew, null, Modifier.size(23.dp),
-            tint = com.lumen.ui.theme.readableForeground(color.value, ink.value))
+        if (connecting && progress != null) {
+            Text("$progress%", color = com.lumen.ui.theme.readableForeground(color.value, ink.value),
+                fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        } else {
+            Icon(Icons.Default.PowerSettingsNew, null, Modifier.size(23.dp),
+                tint = com.lumen.ui.theme.readableForeground(color.value, ink.value))
+        }
         if (connecting) CircularProgressIndicator(Modifier.size(38.dp), color = ink.value, strokeWidth = 2.dp)
     }
 }

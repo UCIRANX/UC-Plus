@@ -18,6 +18,8 @@ private fun russianPlural(count: Int, one: String, few: String, many: String): S
 }
 
 class LumenStrings {
+    /** Name of the built-in group that holds the Tor bridges. */
+    var torGroupName = "Tor"
     var dashboardStyleDock = "Dock control"
     var resetLumen = "Reset UC Plus"; var resetSettings = "Reset settings"; var resetServers = "Delete servers"
     var resetSettingsHint = "Restore preferences. Servers and subscriptions stay."
@@ -309,6 +311,7 @@ class LumenStrings {
 }
 
 private val EN = LumenStrings().apply {
+    torGroupName = "Tor"
     localeCode = "en"
     providerMore="More"; providerLess="Less"
     serverGroup="Server group"
@@ -467,6 +470,7 @@ private val EN = LumenStrings().apply {
 }
 
 private val RU = LumenStrings().apply {
+    torGroupName = "Тор"
     resetLumen="Сброс UC Plus"; resetSettings="Сброс настроек"; resetServers="Удаление серверов"
     resetSettingsHint="Настройки станут исходными. Серверы и подписки останутся."
     resetServersHint="Все серверы, подписки и группы будут удалены. Настройки останутся."
@@ -699,6 +703,7 @@ private val RU = LumenStrings().apply {
 }
 
 private val ZH = LumenStrings().copyFrom(EN).apply {
+    torGroupName = "洋葱路由"
     resetLumen="重置 UC Plus"; resetSettings="重置设置"; resetServers="删除服务器"
     resetSettingsHint="恢复默认设置，保留服务器和订阅。"; resetServersHint="删除所有服务器、订阅和分组，保留设置。"
     resetWarning="连接将停止。此操作无法撤销。"; resetAction="重置"; resetComplete="重置完成"
@@ -926,6 +931,7 @@ private val ZH = LumenStrings().copyFrom(EN).apply {
 }
 
 private val FA = LumenStrings().apply {
+    torGroupName = "تور"
     resetLumen="بازنشانی UC Plus"; resetSettings="بازنشانی تنظیمات"; resetServers="حذف سرورها"
     resetSettingsHint="تنظیمات پیش‌فرض می‌شوند. سرورها و اشتراک‌ها حفظ می‌شوند."
     resetServersHint="همه سرورها، اشتراک‌ها و گروه‌ها حذف می‌شوند. تنظیمات حفظ می‌شوند."
