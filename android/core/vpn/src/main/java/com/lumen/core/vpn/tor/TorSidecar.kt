@@ -1,7 +1,6 @@
 package com.lumen.core.vpn.tor
 
 import android.content.Context
-import com.lumen.core.config.tor.TorCountries
 import com.lumen.core.config.tor.torSlotPort
 import com.lumen.core.vpn.VpnLogBus
 import kotlinx.coroutines.CancellationException
@@ -33,7 +32,6 @@ import kotlin.math.min
 object TorSidecar {
     private const val TAG = "TOR"
     private const val SLOT_TIMEOUT_MS = 240_000L
-    private const val COUNTRY_CIRCUIT_MS = 150_000L
     private const val RACE_TIMEOUT_MS = 480_000L
     private const val POLL_MS = 500L
     const val MAX_PARALLEL = 3
@@ -53,14 +51,11 @@ object TorSidecar {
     private val slotPct = ConcurrentHashMap<Int, Int>()
 
     /**
-     * Tries [candidates] and returns the first working one. [exitCountry] "" means any exit.
-     * Throws with a readable reason when none works in time.
+     * Tries [candidates] and returns the first working one. Throws with a readable reason when
+     * none works in time.
      */
-    suspend fun connect(context: Context, candidates: List<Candidate>, exitCountry: String): Winner {
+    suspend fun connect(context: Context, candidates: List<Candidate>): Winner {
         require(candidates.isNotEmpty()) { "No Tor bridge to try" }
-        val country = TorCountries.normalize(exitCountry)
-        // The GeoIP file for the chosen country is downloaded now, and cached for later connections.
-        val geo = if (country.isNotEmpty()) withContext(Dispatchers.IO) { TorGeo.fetch(context, country) } else null
         stop(context)
         val binary = TorRunnerService.torBinary(context)
         if (candidates.size > 1 && !binary.exists()) {
@@ -76,11 +71,7 @@ object TorSidecar {
         val done = CompletableDeferred<Winner>()
         val failures = ConcurrentLinkedQueue<String>()
         _progress.value = 0
-        VpnLogBus.info(
-            TAG,
-            "Trying ${candidates.size} bridge(s) on $slots instance(s)" +
-                if (country.isNotEmpty()) ", exit ${country.uppercase()}" else ""
-        )
+        VpnLogBus.info(TAG, "Trying ${candidates.size} bridge(s) on $slots instance(s)")
         val winner = withTimeoutOrNull(RACE_TIMEOUT_MS) {
             coroutineScope {
                 val jobs = (0 until slots).map { slot ->
@@ -88,7 +79,7 @@ object TorSidecar {
                         try {
                             while (!done.isCompleted) {
                                 val next = queue.poll() ?: break
-                                val w = runSlot(context, slot, next, country, geo, failures)
+                                val w = runSlot(context, slot, next, failures)
                                 if (w != null) {
                                     // Only the first working slot may win; a late one stops itself.
                                     if (winnerSlot.compareAndSet(-1, slot)) done.complete(w) else stopSlot(context, slot)
@@ -123,8 +114,6 @@ object TorSidecar {
         context: Context,
         slot: Int,
         cand: Candidate,
-        country: String,
-        geo: TorGeo.Paths?,
         failures: ConcurrentLinkedQueue<String>,
     ): Winner? {
         val port = torSlotPort(slot)
@@ -142,13 +131,8 @@ object TorSidecar {
                 .put("socks", port)
                 .put("log", log.absolutePath)
                 .put("bridges", JSONArray().put(cand.line))
-                .put("exitCountry", country)
-            geo?.let { g ->
-                cfg.put("geoip", g.v4.absolutePath)
-                g.v6?.let { cfg.put("geoip6", it.absolutePath) }
-            }
             TorRunnerService.start(context, slot, cfg.toString())
-            result = waitForCircuit(context, slot, port, cand, log, country)
+            result = waitForCircuit(context, slot, port, cand, log)
         } catch (c: CancellationException) {
             stopSlot(context, slot)
             throw c
@@ -168,7 +152,6 @@ object TorSidecar {
         port: Int,
         cand: Candidate,
         log: File,
-        country: String,
     ): Winner? {
         val start = System.currentTimeMillis()
         val deadline = start + SLOT_TIMEOUT_MS
@@ -194,16 +177,7 @@ object TorSidecar {
             }
             if (pct >= 100) {
                 if (probe(port)) return Winner(port, cand.transport, cand.line)
-                if (country.isEmpty()) {
-                    throw IllegalStateException("${cand.transport}: connected, but the internet check failed")
-                }
-                // A circuit that must exit in one country takes longer to build; keep checking for a while.
-                val until = now + COUNTRY_CIRCUIT_MS
-                while (System.currentTimeMillis() < until) {
-                    delay(2_000)
-                    if (probe(port)) return Winner(port, cand.transport, cand.line)
-                }
-                throw IllegalStateException("${cand.transport}: no exit in ${country.uppercase()} answered")
+                throw IllegalStateException("${cand.transport}: connected, but the internet check failed")
             }
             if (now - lastChange > stallMs) throw IllegalStateException("${cand.transport}: stopped at $best%")
         }

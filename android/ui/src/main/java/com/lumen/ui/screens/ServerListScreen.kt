@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -172,7 +173,9 @@ fun ServerListScreen(
     compactGrid: Boolean = false,
     selectedGroupFilter: String? = null,
     onSelectedGroupFilter: (String) -> Unit = {},
-    torControls: @Composable (String) -> Unit = {}
+    torControls: @Composable (String) -> Unit = {},
+    // Tor only: the country list shown instead of the rows. It gets a callback that shows every server.
+    torCountries: (LazyListScope.(onShowServers: () -> Unit) -> Unit)? = null
 ) {
     val lumenColors = LocalLumenColors.current
     val art = com.lumen.ui.theme.expressivePalette()
@@ -206,6 +209,9 @@ fun ServerListScreen(
     var showPingModeDialog by remember { mutableStateOf(false) }
     val uriHandler = LocalUriHandler.current
     var protocol by remember { mutableStateOf("") }
+    // Tor shows countries first; this switches to the full server rows and back.
+    var torShowServers by remember { mutableStateOf(false) }
+    LaunchedEffect(protocol) { torShowServers = false }
     var reachablePref by if (persistPreferences) rememberUiPreference("servers_filter_reachable", "0") else remember { mutableStateOf("0") }
     val onlyReachable = reachablePref == "1"
     var countryPref by if (persistPreferences) rememberUiPreference("servers_group_by_country", "0") else remember { mutableStateOf("0") }
@@ -333,15 +339,24 @@ fun ServerListScreen(
                 onRemoveNoPing = onRemoveNoPingServers,
                 trailing = listToolbar)
 
-            // Tor-only controls (exit country, bridge type, automatic connect) appear under the filter bar.
+            // Tor-only bridge type selector appears under the filter bar.
             torControls(protocol)
 
-            // 5. Server List
+            // 5. Server List (for Tor: the country list until "show servers" is chosen)
+            val torCountryMode = torCountries != null && protocol.equals("tor", ignoreCase = true) && !torShowServers
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 100.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                if (torCountryMode) {
+                    torCountries?.invoke(this) { torShowServers = true }
+                } else {
+                if (torCountries != null && protocol.equals("tor", ignoreCase = true)) {
+                    item(key = "tor_back_to_countries", contentType = "tor_button") {
+                        TextButton(onClick = { torShowServers = false }) { Text(strings.torBackToCountries) }
+                    }
+                }
                 item(key = "server_overview", contentType = "overview") {
             // 3. Subscription Provider Banner (if present and filter matches)
             if (activeSub != null && selectedFilter != "manual") {
@@ -548,6 +563,7 @@ fun ServerListScreen(
                 }
                 item(key = "server_footer", contentType = "spacer") {
                     Spacer(modifier = Modifier.height(16.dp))
+                }
                 }
             }
         }

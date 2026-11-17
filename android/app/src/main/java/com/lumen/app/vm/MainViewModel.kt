@@ -49,7 +49,6 @@ import com.lumen.core.vpn.VpnStartParams
 import com.lumen.core.vpn.tor.TorPrefs
 import com.lumen.core.vpn.tor.TorSidecar
 import com.lumen.core.config.tor.TorBridges
-import com.lumen.core.config.tor.TorCountries
 import com.lumen.core.config.tor.TorPlanner
 import com.lumen.ui.components.ConnectionState
 import com.lumen.ui.components.CountryFlagHelper
@@ -1412,7 +1411,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     scheduleStoredVpnConfigRefresh()
                 }
                 entities.forEach { entity ->
-                    if (!shouldResolveWireGuardCountry(entity)) return@forEach
+                    if (!shouldResolveEndpointCountry(entity)) return@forEach
                     val host = normalizedEndpointHost(entity.server)
                     if (host.isEmpty() || host in _resolvedCountryCodes.value) return@forEach
                     if (!countryLookupAttempted.add(host)) return@forEach
@@ -1598,10 +1597,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun selectNode(node: NodeUiModel) {
         if (_selectedNodeId.value != node.id) resetConnectedPing()
         persistSelectedNodeIdentity(node.id, node.name)
-        // Choosing one Tor server means "use this one"; the auto button turns the pool back on.
-        if (node.protocol.equals("tor", ignoreCase = true) && torPrefs.autoMode) {
-            torPrefs.autoMode = false
-            _torAuto.value = false
+        // Choosing one Tor server means "use this one", not the bridges of its country.
+        if (node.protocol.equals("tor", ignoreCase = true)) {
+            torPrefs.picked = true
+            torPrefs.country = ""
+            _torCountry.value = ""
         }
         scheduleStoredVpnConfigRefresh()
         log("Selected ${node.name}")
@@ -4201,56 +4201,66 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Tor nodes: the VPN service starts Tor before the core runs. In automatic mode it races the
-     * bridges of the chosen type (or all types); for one chosen server it uses only that bridge.
+     * Tor nodes: the VPN service starts Tor before the core runs. One chosen server uses only its
+     * bridge. Otherwise Tor races the bridges of the chosen country (or of every country), limited
+     * to the chosen bridge type.
      */
     private fun withTorSidecar(parsed: ParsedNode, configJson: String): String {
         if (!parsed.scheme.equals("tor", ignoreCase = true)) return configJson
         val line = TorBridges.decode(parsed.link) ?: return configJson
         val prefs = torPrefs
-        val ordered = if (prefs.autoMode) {
+        val ordered = if (prefs.picked) {
+            listOf(line)
+        } else {
+            val country = prefs.country
+            val inCountry: Set<String>? = if (country.isEmpty()) null else nodes.value
+                .filter { it.protocol.equals("tor", ignoreCase = true) && it.countryCode.equals(country, ignoreCase = true) }
+                .mapTo(HashSet()) { it.id }
             val pool = nodeEntities.value
-                .filter { it.protocol.equals("tor", ignoreCase = true) }
+                .filter { it.protocol.equals("tor", ignoreCase = true) && (inCountry == null || it.id in inCountry) }
                 .mapNotNull { TorBridges.decode(it.link) }
             val types = prefs.bridgeType.takeIf { it != "auto" }?.let { setOf(it) }
             TorPlanner.order(pool, prefs.lastGoodLine, types).ifEmpty { listOf(line) }
-        } else {
-            listOf(line)
         }
         val candidates = org.json.JSONArray()
         for (l in ordered) {
             candidates.put(org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l))
         }
-        return org.json.JSONObject(configJson).put("_lumen_tor", org.json.JSONObject()
-            .put("exitCountry", TorCountries.normalize(prefs.exitCountry))
-            .put("candidates", candidates)).toString()
+        return org.json.JSONObject(configJson)
+            .put("_lumen_tor", org.json.JSONObject().put("candidates", candidates))
+            .toString()
     }
 
-    /** Tor exit country, bridge type and automatic mode, as the Tor controls show them. */
+    /** Tor bridge type, country and favorite countries, as the Tor controls show them. */
     private val torPrefs: TorPrefs = TorPrefs(getApplication<Application>())
-    private val _torExitCountry = MutableStateFlow(torPrefs.exitCountry)
-    val torExitCountry: StateFlow<String> = _torExitCountry.asStateFlow()
     private val _torBridgeType = MutableStateFlow(torPrefs.bridgeType)
     val torBridgeType: StateFlow<String> = _torBridgeType.asStateFlow()
-    private val _torAuto = MutableStateFlow(torPrefs.autoMode)
-    val torAuto: StateFlow<Boolean> = _torAuto.asStateFlow()
+    private val _torCountry = MutableStateFlow(torPrefs.country)
 
-    /** Countries that have GeoIP data on the repository, as two-letter codes. */
-    private val _torGeoCountries = MutableStateFlow<List<String>>(emptyList())
-    val torGeoCountries: StateFlow<List<String>> = _torGeoCountries.asStateFlow()
+    /** Country whose bridges are used; "" means bridges from every country. */
+    val torCountry: StateFlow<String> = _torCountry.asStateFlow()
+    private val _torFavoriteCountries = MutableStateFlow(torPrefs.favoriteCountries)
+    val torFavoriteCountries: StateFlow<Set<String>> = _torFavoriteCountries.asStateFlow()
 
-    init {
-        viewModelScope.launch(Dispatchers.IO) {
-            _torGeoCountries.value = com.lumen.core.vpn.tor.TorGeo.countries(getApplication<Application>())
-        }
-    }
-
-    fun setTorExitCountry(code: String) {
-        val c = TorCountries.normalize(code)
-        torPrefs.exitCountry = c
-        _torExitCountry.value = c
-        scheduleStoredVpnConfigRefresh()
-    }
+    /**
+     * Bridge count per country for the chosen bridge type. A country appears once one of its
+     * bridges has been located, so the list only offers countries that have bridges.
+     */
+    val torCountryCounts: StateFlow<Map<String, Int>> =
+        combine(nodes, nodeEntities, _torBridgeType) { list, entities, type ->
+            val links = entities.associate { it.id to it.link }
+            val counts: MutableMap<String, Int> = LinkedHashMap()
+            for (node in list) {
+                if (!node.protocol.equals("tor", ignoreCase = true) || node.countryCode.isBlank()) continue
+                if (type != "auto") {
+                    val bridgeType = TorBridges.decode(links[node.id].orEmpty())?.let { TorBridges.typeOf(it) }
+                    if (bridgeType != type) continue
+                }
+                val code = node.countryCode.uppercase(Locale.US)
+                counts[code] = (counts[code] ?: 0) + 1
+            }
+            counts
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     fun setTorBridgeType(type: String) {
         torPrefs.bridgeType = type
@@ -4258,11 +4268,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         scheduleStoredVpnConfigRefresh()
     }
 
-    /** On: Tor picks bridges from the pool. Off: the selected server is used alone. */
-    fun setTorAutoMode(on: Boolean) {
-        torPrefs.autoMode = on
-        _torAuto.value = on
+    /**
+     * Chooses a country ("" for any). Its bridges are used from now on, and one of its servers is
+     * selected so the connect button starts Tor.
+     */
+    fun selectTorCountry(code: String) {
+        val country = code.trim().uppercase(Locale.US)
+        torPrefs.country = country
+        torPrefs.picked = false
+        _torCountry.value = country
+        val representative = nodes.value.firstOrNull {
+            it.protocol.equals("tor", ignoreCase = true) &&
+                (country.isEmpty() || it.countryCode.equals(country, ignoreCase = true))
+        }
+        if (representative != null) {
+            if (_selectedNodeId.value != representative.id) resetConnectedPing()
+            persistSelectedNodeIdentity(representative.id, representative.name)
+        }
         scheduleStoredVpnConfigRefresh()
+        log(if (country.isEmpty()) "Tor: bridges from any country" else "Tor: bridges from $country")
+    }
+
+    /** Marks or unmarks a country with a heart. Favorite countries are listed first. */
+    fun toggleTorFavoriteCountry(code: String) {
+        val c = code.trim().uppercase(Locale.US)
+        val current = _torFavoriteCountries.value
+        val updated = if (c in current) current - c else current + c
+        torPrefs.favoriteCountries = updated
+        _torFavoriteCountries.value = updated
     }
 
     private fun freeLoopbackPort(): Int =
@@ -4522,11 +4555,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return location.ifBlank { null }
     }
 
-    private fun shouldResolveWireGuardCountry(entity: NodeEntity): Boolean {
+    private fun shouldResolveEndpointCountry(entity: NodeEntity): Boolean {
         val protocol = entity.protocol.trim().lowercase(Locale.US)
+        if (protocol == "tor") return isLocatableTorBridge(entity)
         if (protocol !in setOf("awg", "amneziawg", "wireguard", "wg")) return false
         if (CountryFlagHelper.detectCountryStrict(entity.name, entity.server).isNotEmpty()) return false
         return !isWarpNode(entity)
+    }
+
+    /**
+     * Snowflake and meek reach Tor through shared relays and a CDN, so their address says nothing
+     * about where the bridge is. Only obfs4, webtunnel and vanilla bridges get a country.
+     */
+    private fun isLocatableTorBridge(entity: NodeEntity): Boolean {
+        val line = com.lumen.core.config.tor.TorBridges.decode(entity.link) ?: return false
+        return com.lumen.core.config.tor.TorBridges.typeOf(line) in setOf("obfs4", "webtunnel", "vanilla")
     }
 
     private fun isWarpNode(entity: NodeEntity): Boolean {

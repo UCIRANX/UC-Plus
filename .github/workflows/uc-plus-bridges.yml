@@ -1,8 +1,8 @@
 name: UC Plus Tor bridges
 
 # Collects Tor bridges with tools/collect_bridges.py and publishes tor.txt and bridges.json
-# to the "bridges" branch, plus per-country GeoIP files in geo/ (tools/build_geo.py) for
-# choosing an exit country. The app reads both from that branch.
+# to the "bridges" branch. The app reads tor.txt from that branch and locates each bridge's
+# country itself.
 #
 # Run it on demand: Actions -> "UC Plus Tor bridges" -> "Run workflow".
 # It also runs every hour on its own.
@@ -37,18 +37,13 @@ jobs:
           python3 tools/collect_bridges.py --out "$RUNNER_TEMP/bridges-out"
           echo "Collected lines in tor.txt: $(grep -c . "$RUNNER_TEMP/bridges-out/tor.txt" || true)"
 
-      - name: Build per-country GeoIP files for exit countries
-        run: |
-          set -euo pipefail
-          python3 tools/build_geo.py --out "$RUNNER_TEMP/bridges-out"
-
       - name: Publish tor.txt and bridges.json to the "bridges" branch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/bridges-out"
-          if [ ! -s "$out/tor.txt" ] && [ ! -s "$out/geo/index.txt" ]; then
+          if [ ! -s "$out/tor.txt" ]; then
             echo "::warning::No bridges were collected, so the bridges branch was not changed."
             exit 0
           fi

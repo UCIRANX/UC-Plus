@@ -1,11 +1,10 @@
 package com.lumen.core.vpn.tor
 
 import com.lumen.core.config.tor.TorBridges
-import com.lumen.core.config.tor.TorCountries
 import org.json.JSONObject
 import java.io.File
 
-/** Builds the torrc for one Tor run: a SOCKS listener, one bridge and an optional exit country. */
+/** Builds the torrc for one Tor run: a SOCKS listener and one bridge. */
 object TorrcBuilder {
     private fun clean(s: String) = s.replace('\n', ' ').replace('\r', ' ').trim()
 
@@ -22,21 +21,12 @@ object TorrcBuilder {
         appendLine("ClientOnly 1")
         appendLine("AvoidDiskWrites 1")
         appendLine("SafeLogging 1")
-        // Without GeoIP files Tor cannot map relays to countries, so an exit country never matches.
-        cfg.optString("geoip").takeIf { it.isNotBlank() }?.let { appendLine("GeoIPFile ${clean(it)}") }
-        cfg.optString("geoip6").takeIf { it.isNotBlank() }?.let { appendLine("GeoIPv6File ${clean(it)}") }
         if (bridgeLines.isEmpty()) {
             appendLine("UseBridges 0")
         } else {
             appendLine("UseBridges 1")
             ptPorts.forEach { (t, p) -> appendLine("ClientTransportPlugin $t socks5 127.0.0.1:$p") }
             bridgeLines.forEach { appendLine("Bridge ${clean(TorBridges.normalize(it))}") }
-        }
-        // StrictNodes: when no exit of that country is reachable, Tor fails instead of using another country.
-        val country = TorCountries.normalize(cfg.optString("exitCountry"))
-        if (country.isNotEmpty()) {
-            appendLine("ExitNodes {$country}")
-            appendLine("StrictNodes 1")
         }
     }
 }

@@ -561,11 +561,7 @@ ${hevAuthLines}misc:
                 listOf(com.lumen.core.vpn.tor.TorSidecar.Candidate(
                     tor.optString("transport"), tor.getString("line")))
             }
-            val winner = com.lumen.core.vpn.tor.TorSidecar.connect(
-                applicationContext,
-                candidates = candidates,
-                exitCountry = tor.optString("exitCountry")
-            )
+            val winner = com.lumen.core.vpn.tor.TorSidecar.connect(applicationContext, candidates = candidates)
             // Remembered so the next automatic connection tries this bridge first.
             com.lumen.core.vpn.tor.TorPrefs(applicationContext).lastGoodLine = winner.line
             // The core dials the Tor port that actually connected, which may not be the default one.

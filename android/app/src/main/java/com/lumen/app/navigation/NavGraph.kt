@@ -423,7 +423,8 @@ import com.lumen.ui.screens.ImportPhaseUi
 
 import com.lumen.ui.screens.LocalStrings
 import com.lumen.ui.screens.TorControlsCard
-import com.lumen.ui.screens.TorCountryChoice
+import com.lumen.ui.screens.TorCountryRow
+import com.lumen.ui.screens.torCountryList
 import com.lumen.core.config.tor.TorBridges
 import com.lumen.core.config.tor.TorCountries
 import com.lumen.ui.components.ConnectionState
@@ -1606,33 +1607,39 @@ fun LumenApp(
 
 
 
-                    val torExitCountry by viewModel.torExitCountry.collectAsStateWithLifecycle()
+                    val torCountry by viewModel.torCountry.collectAsStateWithLifecycle()
                     val torBridgeType by viewModel.torBridgeType.collectAsStateWithLifecycle()
-                    val torGeoCountries by viewModel.torGeoCountries.collectAsStateWithLifecycle()
+                    val torCountryCounts by viewModel.torCountryCounts.collectAsStateWithLifecycle()
+                    val torFavoriteCountries by viewModel.torFavoriteCountries.collectAsStateWithLifecycle()
+                    val torStrings = LocalStrings.current
+                    val torLocale = java.util.Locale.forLanguageTag(torStrings.localeCode)
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
                         torControls = { protocol ->
                             if (protocol.equals("tor", ignoreCase = true)) {
-                                val strings = LocalStrings.current
-                                val locale = java.util.Locale.forLanguageTag(strings.localeCode)
                                 TorControlsCard(
-                                    exitCountry = torExitCountry,
-                                    countries = torGeoCountries.map { code ->
-                                        TorCountryChoice(code, TorCountries.name(code, locale))
-                                    },
-                                    onExitCountry = viewModel::setTorExitCountry,
                                     bridgeType = torBridgeType,
-                                    types = listOf("auto" to strings.torTypeAuto) +
+                                    types = listOf("auto" to torStrings.torTypeAuto) +
                                         TorBridges.TYPES.map { it to TorBridges.label(it) },
                                     onBridgeType = viewModel::setTorBridgeType,
-                                    autoConnectEnabled = serversConnectionState != ConnectionState.Connected &&
-                                        serversConnectionState != ConnectionState.Connecting,
-                                    onAutoConnect = {
-                                        viewModel.setTorAutoMode(true)
-                                        onToggleConnection()
-                                    },
                                 )
                             }
+                        },
+                        torCountries = { onShowServers ->
+                            val rows = torCountryCounts.map { (code, count) ->
+                                TorCountryRow(code, TorCountries.name(code, torLocale), count, code in torFavoriteCountries)
+                            }.sortedWith(compareByDescending<TorCountryRow> { it.favorite }.thenBy { it.name })
+                            torCountryList(
+                                rows = rows,
+                                selected = torCountry,
+                                totalCount = torCountryCounts.values.sum(),
+                                anyLabel = torStrings.torAnyCountry,
+                                showServersLabel = torStrings.torShowServers,
+                                emptyText = torStrings.torNoCountries,
+                                onSelect = viewModel::selectTorCountry,
+                                onFavorite = viewModel::toggleTorFavoriteCountry,
+                                onShowServers = onShowServers,
+                            )
                         },
                         compactGrid = settings.compactServerGrid,
                         selectedGroupFilter = selectedServerFilter,

@@ -3,8 +3,8 @@ package com.lumen.core.config.tor
 import java.util.Locale
 
 /**
- * Helpers for exit countries. The list of countries comes from the GeoIP index that the
- * repository publishes, so it only shows countries that have data.
+ * Helpers for the countries of Tor bridges: normalizing codes, flags and names. A country is
+ * listed only when at least one bridge in the app has been located there.
  */
 object TorCountries {
     /** Returns the code in lower case when it is a two-letter code, or "" for "any country". */
