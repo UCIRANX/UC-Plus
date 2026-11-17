@@ -48,6 +48,20 @@ class TorRunnerService : Service() {
         override fun onServiceDisconnected(name: ComponentName?) {}
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        // A crash in this process (Tor, a transport or a native library) shows the system
+        // "keeps stopping" dialog. Record the reason for the app instead and exit quietly.
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            val reason = "${e.javaClass.simpleName}: ${e.message.orEmpty().take(160)}"
+            runCatching { writeState("error:Tor process crashed ($reason)") }
+            runCatching {
+                File(filesDir, "tor/tor.log").appendText("[crash] ${e.stackTraceToString().take(4000)}\n")
+            }
+            Process.killProcess(Process.myPid())
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -85,8 +99,8 @@ class TorRunnerService : Service() {
                     // Binding alone does not start Tor. ACTION_START is required by tor-android.
                     startService(Intent(this, TorService::class.java).setAction(TorService.ACTION_START))
                     bindService(Intent(this, TorService::class.java), conn, Context.BIND_AUTO_CREATE)
-                } catch (e: Exception) {
-                    writeState("error:" + (e.message ?: "tor start failed"))
+                } catch (e: Throwable) {
+                    writeState("error:" + (e.message ?: e.javaClass.simpleName))
                     false
                 }
             }
