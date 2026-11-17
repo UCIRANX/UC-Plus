@@ -175,7 +175,7 @@ fun ServerListScreen(
     onSelectedGroupFilter: (String) -> Unit = {},
     torControls: @Composable (String) -> Unit = {},
     // Tor only: the country list shown instead of the rows. It gets a callback that shows every server.
-    torCountries: (LazyListScope.(onShowServers: () -> Unit) -> Unit)? = null,
+    torCountries: (LazyListScope.(TorServerActions) -> Unit)? = null,
     disabledProtocols: Set<String> = emptySet(),
     onProtocolEnabledChange: (String, Boolean) -> Unit = { _, _ -> }
 ) {
@@ -226,7 +226,7 @@ fun ServerListScreen(
         if (autoPingOnOpen && nodes.isNotEmpty() && !autoPingStarted) {
             autoPingStarted = true
             // Respect the active protocol filter: ping only that group, or everything when no filter is set.
-            if (protocol.isBlank()) onPingNodes(nodes.filter { protocolKey(it) !in disabledProtocols })
+            if (protocol.isBlank()) onPingNodes(nodes.filter { protocolKey(it) !in disabledProtocols || it.isFavorite })
             else onPingNodes(nodes.filter { protocolKey(it) == protocol })
         }
     }
@@ -242,7 +242,18 @@ fun ServerListScreen(
     // All-protocols ping skips unchecked protocols, favourites included. Inside a protocol's own
     // section its servers are pinged, even when that protocol is unchecked.
     fun pingTargets(list: List<NodeUiModel>): List<NodeUiModel> =
-        if (protocol.isBlank()) list.filter { protocolKey(it) !in disabledProtocols } else list
+        if (protocol.isBlank()) list.filter { protocolKey(it) !in disabledProtocols || it.isFavorite } else list
+    // In the all-protocols list, Tor servers are shown as their countries instead of one by one.
+    val torBlockShown = torCountries != null && protocol.isBlank() &&
+        "tor" !in disabledProtocols && nodes.any { protocolKey(it) == "tor" }
+    val listedNodes = if (torBlockShown) filteredNodes.filterNot { protocolKey(it) == "tor" } else filteredNodes
+    val torActions = TorServerActions(
+        onSelect = selectServer,
+        onPing = onPingNode,
+        onCopy = onCopyNodeLink,
+        onExportQr = onExportQrCode,
+        onDelete = { node -> if (!node.isFavorite) deletingNode = node },
+    )
     LaunchedEffect(prepared.source, pendingSelectedId) {
         if (pendingSelectedId != null && (prepared.source.any { it.id == pendingSelectedId && it.isSelected } ||
                 (prepared.source === nodes && nodes.none { it.id == pendingSelectedId }))) pendingSelectedId = null
@@ -359,8 +370,9 @@ fun ServerListScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 if (torCountryMode) {
-                    torCountries?.invoke(this) { torShowServers = true }
+                    torCountries?.invoke(this, torActions)
                 } else {
+                if (torBlockShown) torCountries?.invoke(this, torActions)
                 if (torCountries != null && protocol.equals("tor", ignoreCase = true)) {
                     item(key = "tor_back_to_countries", contentType = "tor_button") {
                         TextButton(onClick = { torShowServers = false }) { Text(strings.torBackToCountries) }
@@ -527,8 +539,8 @@ fun ServerListScreen(
                         }
                     }
                 }
-                val sections = if (groupByCountry) filteredNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }
-                    else mapOf("" to filteredNodes)
+                val sections = if (groupByCountry) listedNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }
+                    else mapOf("" to listedNodes)
                 sections.forEach { (country, sectionNodes) ->
                     if (country.isNotBlank()) item(key = "country:$country", contentType = "country") {
                         Text("${CountryFlagHelper.getFlagEmoji(country)}  $country · ${sectionNodes.size}",

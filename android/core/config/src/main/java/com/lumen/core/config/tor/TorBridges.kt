@@ -32,7 +32,7 @@ object TorBridges {
     private val FINGERPRINT = Regex("(?<![0-9A-Fa-f])[0-9A-Fa-f]{40}(?![0-9A-Fa-f])")
 
     /** Every transport a bridge list can contain. */
-    val TYPES = listOf("webtunnel", "obfs4", "snowflake", "meek_lite", "vanilla")
+    val TYPES = listOf("webtunnel", "obfs4", "vanilla", "snowflake", "meek_lite")
 
     private const val PREFIX = "tor://"
 

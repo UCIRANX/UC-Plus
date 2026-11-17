@@ -51,7 +51,7 @@ TEXT_SOURCES = [
 TELEGRAM_CHANNELS = ["tor_bridges", "vanilla_bridges", "rutorbridgesobfs4webtunnel"]
 TELEGRAM_PAGES = 3
 
-LIMITS = {"webtunnel": 150, "obfs4": 300, "vanilla": 150}
+LIMITS = {"webtunnel": 300, "obfs4": 300, "vanilla": 300}  # at most 300 bridges per transport
 
 FP = r"[0-9A-Fa-f]{40}"
 ADDR = r"(?:\[[0-9A-Fa-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}"
@@ -271,9 +271,8 @@ def main():
                 return 1
 
         alive.sort(key=lambda x: (port_rank(x[0]), -min(x[1], 3), x[2]))
-        lines = [l for l, _, _ in alive][: LIMITS[t]]
-        lines += [l for l, _ in sorted(v6, key=lambda x: -x[1])][: max(0, LIMITS[t] // 5)]
-        result[t] = lines
+        lines = [l for l, _, _ in alive] + [l for l, _ in sorted(v6, key=lambda x: -x[1])]
+        result[t] = lines[: LIMITS[t]]
 
     result["snowflake"] = moat.get("snowflake", [])
     result["meek_lite"] = moat.get("meek_lite", [])

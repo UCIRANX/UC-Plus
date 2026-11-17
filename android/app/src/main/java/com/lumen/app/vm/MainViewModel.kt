@@ -1617,6 +1617,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Choosing one Tor server means "use this one", not the bridges of its country.
         if (node.protocol.equals("tor", ignoreCase = true)) {
             torPrefs.picked = true
+            _torPicked.value = true
             torPrefs.country = ""
             _torCountry.value = ""
         }
@@ -4281,6 +4282,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val torPrefs: TorPrefs = TorPrefs(getApplication<Application>())
     private val _torBridgeType = MutableStateFlow(torPrefs.bridgeType)
     val torBridgeType: StateFlow<String> = _torBridgeType.asStateFlow()
+    // True when the last Tor choice was one server, not a country.
+    private val _torPicked = MutableStateFlow(torPrefs.picked)
+    val torPicked: StateFlow<Boolean> = _torPicked.asStateFlow()
     private val _torCountry = MutableStateFlow(torPrefs.country)
 
     /** Country whose bridges are used; "" means bridges from every country. */
@@ -4326,6 +4330,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val country = code.trim().uppercase(Locale.US)
         torPrefs.country = country
         torPrefs.picked = false
+        _torPicked.value = false
         _torCountry.value = country
         // Taken from the same bridge-type filtered list that the country row counts, so the
         // server shown as selected is always one of the bridges that will actually be used.

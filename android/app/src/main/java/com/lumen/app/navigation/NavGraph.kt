@@ -1612,6 +1612,11 @@ fun LumenApp(
                     val torBridgeType by viewModel.torBridgeType.collectAsStateWithLifecycle()
                     val torCountryCounts by viewModel.torCountryCounts.collectAsStateWithLifecycle()
                     val torFavoriteCountries by viewModel.torFavoriteCountries.collectAsStateWithLifecycle()
+                    val torPicked by viewModel.torPicked.collectAsStateWithLifecycle()
+                    // Tor's choice is highlighted only while a Tor config is the active one. Choosing a
+                    // config from another section makes the old Tor highlight disappear.
+                    val torSelectedActive = nodes.any { it.isSelected && it.protocol.equals("tor", ignoreCase = true) }
+                    val torHighlight: String? = if (torSelectedActive && !torPicked) torCountry else null
                     val torServersByCountry by viewModel.torServersByCountry.collectAsStateWithLifecycle()
                     val disabledProtocols by viewModel.disabledProtocols.collectAsStateWithLifecycle()
                     var torExpandedCode by rememberSaveable { mutableStateOf("") }
@@ -1635,19 +1640,23 @@ fun LumenApp(
                                 )
                             }
                         },
-                        torCountries = { onShowServers ->
+                        torCountries = { actions ->
                             val rows = torCountryCounts.map { (code, count) ->
-                                TorCountryRow(code, TorCountries.name(code, torLocale), count, code in torFavoriteCountries)
+                                val best = torServersByCountry[code].orEmpty()
+                                    .mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }
+                                    .minOrNull()
+                                TorCountryRow(code, TorCountries.name(code, torLocale), count,
+                                    code in torFavoriteCountries, best)
                             }.sortedWith(compareByDescending<TorCountryRow> { it.favorite }.thenBy { it.name })
                             torCountryList(
                                 rows = rows,
-                                selected = torCountry,
+                                selectedCountry = torHighlight,
                                 totalCount = torCountryCounts.values.sum(),
                                 anyLabel = torStrings.torAnyCountry,
-                                showServersLabel = torStrings.torShowServers,
                                 emptyText = torStrings.torNoCountries,
                                 expandedCode = torExpandedCode,
                                 serversOf = { code -> torServersByCountry[code].orEmpty() },
+                                actions = actions,
                                 onSelect = { code ->
                                     viewModel.selectTorCountry(code)
                                     restartIfRunningForTorChoice()
@@ -1655,12 +1664,7 @@ fun LumenApp(
                                 onToggleExpand = { code ->
                                     torExpandedCode = if (torExpandedCode.equals(code, ignoreCase = true)) "" else code
                                 },
-                                onSelectServer = { node ->
-                                    viewModel.selectNode(node)
-                                    restartIfRunningForTorChoice()
-                                },
                                 onFavorite = viewModel::toggleTorFavoriteCountry,
-                                onShowServers = onShowServers,
                             )
                         },
                         compactGrid = settings.compactServerGrid,
