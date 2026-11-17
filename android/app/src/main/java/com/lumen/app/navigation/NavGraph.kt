@@ -1608,6 +1608,7 @@ fun LumenApp(
 
                     val torExitCountry by viewModel.torExitCountry.collectAsStateWithLifecycle()
                     val torBridgeType by viewModel.torBridgeType.collectAsStateWithLifecycle()
+                    val torGeoCountries by viewModel.torGeoCountries.collectAsStateWithLifecycle()
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
                         torControls = { protocol ->
@@ -1616,7 +1617,7 @@ fun LumenApp(
                                 val locale = java.util.Locale.forLanguageTag(strings.localeCode)
                                 TorControlsCard(
                                     exitCountry = torExitCountry,
-                                    countries = TorCountries.CODES.map { code ->
+                                    countries = torGeoCountries.map { code ->
                                         TorCountryChoice(code, TorCountries.name(code, locale))
                                     },
                                     onExitCountry = viewModel::setTorExitCountry,

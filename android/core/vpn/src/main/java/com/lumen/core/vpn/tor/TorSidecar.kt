@@ -59,14 +59,8 @@ object TorSidecar {
     suspend fun connect(context: Context, candidates: List<Candidate>, exitCountry: String): Winner {
         require(candidates.isNotEmpty()) { "No Tor bridge to try" }
         val country = TorCountries.normalize(exitCountry)
-        val geoOk = if (country.isNotEmpty()) {
-            if (GeoIpInstaller.install(context) == null) {
-                throw IllegalStateException("GeoIP files are missing from this build, so an exit country cannot be chosen")
-            }
-            true
-        } else {
-            false
-        }
+        // The GeoIP file for the chosen country is downloaded now, and cached for later connections.
+        val geo = if (country.isNotEmpty()) withContext(Dispatchers.IO) { TorGeo.fetch(context, country) } else null
         stop(context)
         val binary = TorRunnerService.torBinary(context)
         if (candidates.size > 1 && !binary.exists()) {
@@ -94,7 +88,7 @@ object TorSidecar {
                         try {
                             while (!done.isCompleted) {
                                 val next = queue.poll() ?: break
-                                val w = runSlot(context, slot, next, country, geoOk, failures)
+                                val w = runSlot(context, slot, next, country, geo, failures)
                                 if (w != null) {
                                     // Only the first working slot may win; a late one stops itself.
                                     if (winnerSlot.compareAndSet(-1, slot)) done.complete(w) else stopSlot(context, slot)
@@ -130,7 +124,7 @@ object TorSidecar {
         slot: Int,
         cand: Candidate,
         country: String,
-        geoOk: Boolean,
+        geo: TorGeo.Paths?,
         failures: ConcurrentLinkedQueue<String>,
     ): Winner? {
         val port = torSlotPort(slot)
@@ -149,11 +143,9 @@ object TorSidecar {
                 .put("log", log.absolutePath)
                 .put("bridges", JSONArray().put(cand.line))
                 .put("exitCountry", country)
-            if (geoOk) {
-                GeoIpInstaller.install(context)?.let { g ->
-                    cfg.put("geoip", g.v4.absolutePath)
-                    g.v6?.let { cfg.put("geoip6", it.absolutePath) }
-                }
+            geo?.let { g ->
+                cfg.put("geoip", g.v4.absolutePath)
+                g.v6?.let { cfg.put("geoip6", it.absolutePath) }
             }
             TorRunnerService.start(context, slot, cfg.toString())
             result = waitForCircuit(context, slot, port, cand, log, country)

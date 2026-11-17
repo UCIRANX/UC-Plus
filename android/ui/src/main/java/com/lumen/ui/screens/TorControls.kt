@@ -10,7 +10,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -36,11 +35,8 @@ fun TorControlsCard(
     onAutoConnect: () -> Unit,
 ) {
     val s = LocalStrings.current
-    val ctx = LocalContext.current
-    // The exit country needs the GeoIP files bundled by the build.
-    val geoReady = remember {
-        runCatching { ctx.assets.list("geoip")?.contains("geoip") == true }.getOrDefault(false)
-    }
+    // The picker is usable once the repository's country index has loaded.
+    val geoReady = countries.isNotEmpty()
     var countryMenu by remember { mutableStateOf(false) }
     val chosen = countries.firstOrNull { it.code == exitCountry }
 

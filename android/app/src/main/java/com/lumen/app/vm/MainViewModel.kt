@@ -4235,6 +4235,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _torAuto = MutableStateFlow(torPrefs.autoMode)
     val torAuto: StateFlow<Boolean> = _torAuto.asStateFlow()
 
+    /** Countries that have GeoIP data on the repository, as two-letter codes. */
+    private val _torGeoCountries = MutableStateFlow<List<String>>(emptyList())
+    val torGeoCountries: StateFlow<List<String>> = _torGeoCountries.asStateFlow()
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            _torGeoCountries.value = com.lumen.core.vpn.tor.TorGeo.countries(getApplication<Application>())
+        }
+    }
+
     fun setTorExitCountry(code: String) {
         val c = TorCountries.normalize(code)
         torPrefs.exitCountry = c
