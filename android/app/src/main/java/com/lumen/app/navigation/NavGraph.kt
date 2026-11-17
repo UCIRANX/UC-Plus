@@ -1615,10 +1615,11 @@ fun LumenApp(
                     val torServersByCountry by viewModel.torServersByCountry.collectAsStateWithLifecycle()
                     val disabledProtocols by viewModel.disabledProtocols.collectAsStateWithLifecycle()
                     var torExpandedCode by rememberSaveable { mutableStateOf("") }
-                    // Choosing a Tor country or server means "connect to it". A running tunnel is restarted.
-                    val connectForTorChoice: () -> Unit = {
+                    // Choosing a Tor country or server only changes the selection. It never starts the
+                    // tunnel; the connect button does that. A tunnel that is already running is restarted
+                    // on the new choice, the same way a normal server selection behaves.
+                    val restartIfRunningForTorChoice: () -> Unit = {
                         if (LumenVpnService.isRunning.value || LumenVpnService.isStarting.value) onRestartConnection()
-                        else onToggleConnection()
                     }
                     val torStrings = LocalStrings.current
                     val torLocale = java.util.Locale.forLanguageTag(torStrings.localeCode)
@@ -1649,14 +1650,14 @@ fun LumenApp(
                                 serversOf = { code -> torServersByCountry[code].orEmpty() },
                                 onSelect = { code ->
                                     viewModel.selectTorCountry(code)
-                                    connectForTorChoice()
+                                    restartIfRunningForTorChoice()
                                 },
                                 onToggleExpand = { code ->
                                     torExpandedCode = if (torExpandedCode.equals(code, ignoreCase = true)) "" else code
                                 },
                                 onSelectServer = { node ->
                                     viewModel.selectNode(node)
-                                    connectForTorChoice()
+                                    restartIfRunningForTorChoice()
                                 },
                                 onFavorite = viewModel::toggleTorFavoriteCountry,
                                 onShowServers = onShowServers,

@@ -153,6 +153,11 @@ open class TorRunnerService : Service() {
         }
         File(dir, "geoip").takeIf { it.exists() }?.let { cfg.put("geoip_file", it.absolutePath) }
         File(dir, "geoip6").takeIf { it.exists() }?.let { cfg.put("geoip6_file", it.absolutePath) }
+        val exit = cfg.optString("exit_country")
+        if (exit.isNotEmpty()) {
+            val hasGeoIp = File(dir, "geoip").exists()
+            com.lumen.core.vpn.VpnLogBus.info("Tor", "Exit country $exit requested; GeoIP ${if (hasGeoIp) "loaded" else "missing"}")
+        }
         if (!File(dir, "geoip").exists() && cfg.optString("exit_country").isNotEmpty()) {
             com.lumen.core.vpn.VpnLogBus.warning("Tor",
                 "No GeoIP data in this build: the exit country cannot be enforced, the IP may differ.")
