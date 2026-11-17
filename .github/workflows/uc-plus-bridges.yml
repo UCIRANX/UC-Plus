@@ -1,0 +1,56 @@
+name: UC Plus Tor bridges
+
+# Collects Tor bridges with tools/collect_bridges.py and publishes tor.txt and bridges.json
+# to the "bridges" branch. The app's built-in "Tor" subscription reads tor.txt from there.
+#
+# Run it on demand: Actions -> "UC Plus Tor bridges" -> "Run workflow".
+# It also runs every hour on its own.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uc-plus-bridges
+  cancel-in-progress: false
+
+jobs:
+  bridges:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools
+          fetch-depth: 1
+
+      - name: Collect Tor bridges
+        run: |
+          set -euo pipefail
+          python3 tools/collect_bridges.py --out "$RUNNER_TEMP/bridges-out"
+          echo "Collected lines in tor.txt: $(grep -c . "$RUNNER_TEMP/bridges-out/tor.txt" || true)"
+
+      - name: Publish tor.txt and bridges.json to the "bridges" branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/bridges-out"
+          if [ ! -s "$out/tor.txt" ]; then
+            echo "::warning::No bridges were collected, so the bridges branch was not changed."
+            exit 0
+          fi
+          cd "$out"
+          git init -q
+          git checkout -q -b bridges
+          git add -A
+          git -c user.name="uc-plus-bridges" -c user.email="uc-plus-bridges@users.noreply.github.com" \
+            commit -q -m "Update Tor bridges $(date -u +%FT%TZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bridges
+          echo "Published to the bridges branch."

@@ -5,12 +5,9 @@ name: UC Plus build and release
 #  2. restores the release signing key from the KEYSTORE_BASE64 secret (or creates it once),
 #  3. builds the native engines and the signed APKs,
 #  4. publishes one release per build, marked as the latest, with an APK for every ABI.
-# Every hour the "bridges" job collects Tor bridges and publishes tor.txt to the "bridges" branch,
-# which is the built-in Tor subscription of the app.
+# Tor bridges are collected by the separate "UC Plus Tor bridges" workflow.
 
 on:
-  schedule:
-    - cron: "17 * * * *"
   push:
     # Branch pushes only. Tag pushes ignore "paths", so without this the release tags
     # created by this workflow would start it again.
@@ -28,43 +25,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  bridges:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    concurrency:
-      group: uc-plus-bridges
-      cancel-in-progress: false
-    steps:
-      - name: Check out the repository
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            tools
-          fetch-depth: 1
-
-      - name: Collect Tor bridges
-        run: |
-          set -euo pipefail
-          python3 tools/collect_bridges.py --out "$RUNNER_TEMP/bridges-out"
-
-      - name: Publish tor.txt and bridges.json to the "bridges" branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/bridges-out"
-          [ -s "$out/tor.txt" ] || { echo "No bridges collected; keeping the previous list."; exit 0; }
-          cd "$out"
-          git init -q
-          git checkout -q -b bridges
-          git add -A
-          git -c user.name="uc-plus-bridges" -c user.email="uc-plus-bridges@users.noreply.github.com" \
-            commit -q -m "Update Tor bridges $(date -u +%FT%TZ)"
-          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" bridges
-
   release:
-    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
