@@ -26,3 +26,14 @@
 # reachability from the decryptor alone cannot preserve them or their names.
 -keep class org.bouncycastle.jcajce.provider.symmetric.** { *; }
 -keep class org.bouncycastle.jcajce.provider.digest.** { *; }
+
+# Tor (tor-android, jtorctl) and its pluggable transports (IPtProxy) are native-backed and
+# reach their own fields and methods across JNI and reflection. Shrinking them breaks the
+# Tor service at runtime with NoSuchFieldError, so keep them whole.
+-keep class org.torproject.** { *; }
+-keep class info.guardianproject.** { *; }
+-keep class IPtProxy.** { *; }
+-keep class go.** { *; }
+-dontwarn org.torproject.**
+-dontwarn IPtProxy.**
+-dontwarn info.guardianproject.**
