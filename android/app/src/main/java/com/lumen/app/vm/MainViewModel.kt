@@ -4222,13 +4222,37 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             val types = prefs.bridgeType.takeIf { it != "auto" }?.let { setOf(it) }
             TorPlanner.order(pool, prefs.lastGoodLine, types).ifEmpty { listOf(line) }
         }
+        // The exit relay decides the IP the internet sees, so it must sit in the chosen country.
+        // A single picked server uses the country of that server.
+        val exit = if (prefs.picked) {
+            nodes.value.firstOrNull { it.id == _selectedNodeId.value }?.countryCode.orEmpty()
+        } else prefs.country
         val candidates = org.json.JSONArray()
         for (l in ordered) {
-            candidates.put(org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l))
+            candidates.put(org.json.JSONObject().put("transport", TorBridges.typeOf(l)).put("line", l).put("exit", exit))
         }
         return org.json.JSONObject(configJson)
             .put("_lumen_tor", org.json.JSONObject().put("candidates", candidates))
             .toString()
+    }
+
+    /**
+     * Protocols the user unchecked in the protocol list. Their servers are hidden from the
+     * all-protocols list and skipped by all-protocols ping, but never by subscription refresh.
+     */
+    private val _disabledProtocols = MutableStateFlow(
+        prefs.getStringSet(K_DISABLED_PROTOCOLS, emptySet()).orEmpty().toSet()
+    )
+    val disabledProtocols: StateFlow<Set<String>> = _disabledProtocols.asStateFlow()
+
+    fun setProtocolEnabled(protocol: String, enabled: Boolean) {
+        val key = protocol.trim().lowercase(Locale.US)
+        if (key.isEmpty()) return
+        val current = _disabledProtocols.value
+        val updated = if (enabled) current - key else current + key
+        if (updated == current) return
+        _disabledProtocols.value = updated
+        prefs.edit().putStringSet(K_DISABLED_PROTOCOLS, updated).apply()
     }
 
     /** Tor bridge type, country and favorite countries, as the Tor controls show them. */
@@ -4243,24 +4267,28 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     val torFavoriteCountries: StateFlow<Set<String>> = _torFavoriteCountries.asStateFlow()
 
     /**
-     * Bridge count per country for the chosen bridge type. A country appears once one of its
+     * Tor servers per country for the chosen bridge type. A country appears once one of its
      * bridges has been located, so the list only offers countries that have bridges.
      */
-    val torCountryCounts: StateFlow<Map<String, Int>> =
+    val torServersByCountry: StateFlow<Map<String, List<NodeUiModel>>> =
         combine(nodes, nodeEntities, _torBridgeType) { list, entities, type ->
             val links = entities.associate { it.id to it.link }
-            val counts: MutableMap<String, Int> = LinkedHashMap()
+            val grouped: MutableMap<String, MutableList<NodeUiModel>> = LinkedHashMap()
             for (node in list) {
                 if (!node.protocol.equals("tor", ignoreCase = true) || node.countryCode.isBlank()) continue
                 if (type != "auto") {
                     val bridgeType = TorBridges.decode(links[node.id].orEmpty())?.let { TorBridges.typeOf(it) }
                     if (bridgeType != type) continue
                 }
-                val code = node.countryCode.uppercase(Locale.US)
-                counts[code] = (counts[code] ?: 0) + 1
+                grouped.getOrPut(node.countryCode.uppercase(Locale.US)) { mutableListOf() }.add(node)
             }
-            counts
+            grouped
         }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    /** Bridge count per country, derived from [torServersByCountry]. */
+    val torCountryCounts: StateFlow<Map<String, Int>> =
+        torServersByCountry.map { byCountry -> byCountry.mapValues { it.value.size } }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     fun setTorBridgeType(type: String) {
         torPrefs.bridgeType = type
@@ -4677,6 +4705,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         const val PREFS_NAME = "lumen_prefs"
+        private const val K_DISABLED_PROTOCOLS = "disabled_protocols"
 
         /**
          * Launcher icon the user pinned. Read before [_settings] exists (startup

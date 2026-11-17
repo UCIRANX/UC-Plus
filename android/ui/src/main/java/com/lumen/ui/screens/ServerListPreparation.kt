@@ -7,7 +7,8 @@ import kotlinx.coroutines.withContext
 internal data class ServerListQuery(
     val group: String, val text: String = "", val protocol: String = "",
     val onlyReachable: Boolean = false, val sort: ServerSort = ServerSort.PING,
-    val maxPing: Int = 0, val groupByCountry: Boolean = false
+    val maxPing: Int = 0, val groupByCountry: Boolean = false,
+    val disabledProtocols: Set<String> = emptySet()
 )
 
 internal data class PreparedServerList(
@@ -49,6 +50,8 @@ internal fun prepareServerList(nodes: List<NodeUiModel>, query: ServerListQuery)
     val candidates = nodesForServerFilter(nodes, query.group).filter { node ->
         (searchEmpty || node.name.contains(search, true) || node.server.contains(search, true) || node.protocol.contains(search, true)) &&
             (query.protocol.isBlank() || protocolKey(node) == query.protocol) &&
+            // All-protocols view hides unchecked protocols, but favourites always stay visible.
+            (query.protocol.isNotBlank() || protocolKey(node) !in query.disabledProtocols || node.isFavorite) &&
             (!query.onlyReachable || (node.pingMs ?: 0) > 0) &&
             (query.maxPing <= 0 || (node.pingMs?.let { it in 1..query.maxPing } == true))
     }

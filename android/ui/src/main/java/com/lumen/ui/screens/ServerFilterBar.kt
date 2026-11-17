@@ -11,6 +11,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -26,7 +27,10 @@ internal fun ServerFilterBar(
     reachable: Boolean, onReachable: (Boolean) -> Unit, maxPing: Int, onMaxPing: (Int) -> Unit,
     onReset: () -> Unit, refreshing: Boolean, onRefreshAll: () -> Unit,
     noPingCount: Int = 0, onRemoveNoPing: () -> Unit = {},
-    trailing: @Composable () -> Unit = {}
+    trailing: @Composable () -> Unit = {},
+    // Protocols the user unchecked: hidden from the all-protocols list and skipped by its ping.
+    disabledProtocols: Set<String> = emptySet(),
+    onProtocolEnabled: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val s = LocalStrings.current
     var protocolMenu by remember { mutableStateOf(false) }
@@ -44,9 +48,21 @@ internal fun ServerFilterBar(
                 Icon(Icons.Default.KeyboardArrowDown, null, Modifier.size(16.dp))
             }
             LumenMenu(protocolMenu, { protocolMenu = false }) {
-                (listOf("" to s.allProtocols) + protocols.map { it to if (it.equals("locked", true))
-                    InterfaceText.PROTECTED.inLanguage(s.localeCode) else it.uppercase() }).forEach { (id, label) ->
-                    DropdownMenuItem(text = { Text(label) }, trailingIcon = { if (protocol == id) Icon(Icons.Default.Check, null) },
+                DropdownMenuItem(text = { Text(s.allProtocols) },
+                    trailingIcon = { if (protocol.isEmpty()) Icon(Icons.Default.Check, null) },
+                    onClick = { onProtocol(""); protocolMenu = false })
+                protocols.forEach { id ->
+                    val label = if (id.equals("locked", true)) InterfaceText.PROTECTED.inLanguage(s.localeCode) else id.uppercase()
+                    DropdownMenuItem(
+                        text = {
+                            // The name chooses the protocol section; the box only decides whether it is listed.
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(label, Modifier.weight(1f),
+                                    fontWeight = if (protocol == id) FontWeight.Bold else FontWeight.Normal)
+                                Checkbox(checked = id !in disabledProtocols,
+                                    onCheckedChange = { onProtocolEnabled(id, it) })
+                            }
+                        },
                         onClick = { onProtocol(id); protocolMenu = false })
                 }
             }

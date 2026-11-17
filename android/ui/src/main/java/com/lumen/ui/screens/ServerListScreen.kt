@@ -175,7 +175,9 @@ fun ServerListScreen(
     onSelectedGroupFilter: (String) -> Unit = {},
     torControls: @Composable (String) -> Unit = {},
     // Tor only: the country list shown instead of the rows. It gets a callback that shows every server.
-    torCountries: (LazyListScope.(onShowServers: () -> Unit) -> Unit)? = null
+    torCountries: (LazyListScope.(onShowServers: () -> Unit) -> Unit)? = null,
+    disabledProtocols: Set<String> = emptySet(),
+    onProtocolEnabledChange: (String, Boolean) -> Unit = { _, _ -> }
 ) {
     val lumenColors = LocalLumenColors.current
     val art = com.lumen.ui.theme.expressivePalette()
@@ -224,18 +226,23 @@ fun ServerListScreen(
         if (autoPingOnOpen && nodes.isNotEmpty() && !autoPingStarted) {
             autoPingStarted = true
             // Respect the active protocol filter: ping only that group, or everything when no filter is set.
-            if (protocol.isBlank()) onPingAll()
+            if (protocol.isBlank()) onPingNodes(nodes.filter { protocolKey(it) !in disabledProtocols })
             else onPingNodes(nodes.filter { protocolKey(it) == protocol })
         }
     }
     BackHandler(enabled = selectedIds.isNotEmpty()) { selectedIds = emptySet() }
 
-    val query = ServerListQuery(selectedFilter, searchQuery, protocol, onlyReachable, currentSort, maxPing, groupByCountry)
+    val query = ServerListQuery(selectedFilter, searchQuery, protocol, onlyReachable, currentSort, maxPing, groupByCountry,
+        disabledProtocols)
     val prepared by rememberPreparedServerList(nodes, query)
     val preparing = prepared.source !== nodes || prepared.query != query
     val manualNodesCount = prepared.manualCount
     // Keep rows during a ping refresh; never display another group's rows after switching groups.
     val filteredNodes = if (prepared.query.group == selectedFilter) prepared.visible else emptyList()
+    // All-protocols ping skips unchecked protocols, favourites included. Inside a protocol's own
+    // section its servers are pinged, even when that protocol is unchecked.
+    fun pingTargets(list: List<NodeUiModel>): List<NodeUiModel> =
+        if (protocol.isBlank()) list.filter { protocolKey(it) !in disabledProtocols } else list
     LaunchedEffect(prepared.source, pendingSelectedId) {
         if (pendingSelectedId != null && (prepared.source.any { it.id == pendingSelectedId && it.isSelected } ||
                 (prepared.source === nodes && nodes.none { it.id == pendingSelectedId }))) pendingSelectedId = null
@@ -318,11 +325,11 @@ fun ServerListScreen(
                     LumenMenu(expanded = showPingModeDialog && !isPinging, onDismissRequest = { showPingModeDialog = false }) {
                         DropdownMenuItem(text = { Text(strings.pingFromStart) }, onClick = {
                             showPingModeDialog = false
-                            onPingNodes(filteredNodes)
+                            onPingNodes(pingTargets(filteredNodes))
                         })
                         DropdownMenuItem(text = { Text(strings.pingContinue) }, onClick = {
                             showPingModeDialog = false
-                            onPingNodes(filteredNodes.filter { it.pingMs == null })
+                            onPingNodes(pingTargets(filteredNodes).filter { it.pingMs == null })
                         })
                     }
                 }
@@ -337,7 +344,9 @@ fun ServerListScreen(
                 onRefreshAll = onRefreshAllSubscriptions,
                 noPingCount = nodes.count { it.pingMs == 0 && !it.isFavorite },
                 onRemoveNoPing = onRemoveNoPingServers,
-                trailing = listToolbar)
+                trailing = listToolbar,
+                disabledProtocols = disabledProtocols,
+                onProtocolEnabled = onProtocolEnabledChange)
 
             // Tor-only bridge type selector appears under the filter bar.
             torControls(protocol)

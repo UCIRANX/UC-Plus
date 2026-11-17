@@ -7,7 +7,10 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -78,9 +81,9 @@ private fun TorTypeChip(label: String, selected: Boolean, onClick: () -> Unit, m
 }
 
 /**
- * The Tor country list, drawn in place of the server rows. The first row means "any country",
- * then one row per country that has bridges, each with a heart like the server rows. The last
- * row shows every server.
+ * The Tor country list, drawn in place of the server rows. The first row means "any country".
+ * Each country row selects that country when its name is tapped, and its arrow opens the servers
+ * of that country just below it. The last row shows every server.
  */
 fun LazyListScope.torCountryList(
     rows: List<TorCountryRow>,
@@ -89,7 +92,11 @@ fun LazyListScope.torCountryList(
     anyLabel: String,
     showServersLabel: String,
     emptyText: String,
+    expandedCode: String,
+    serversOf: (String) -> List<NodeUiModel>,
     onSelect: (String) -> Unit,
+    onToggleExpand: (String) -> Unit,
+    onSelectServer: (NodeUiModel) -> Unit,
     onFavorite: (String) -> Unit,
     onShowServers: () -> Unit,
 ) {
@@ -100,7 +107,9 @@ fun LazyListScope.torCountryList(
             count = totalCount,
             selected = selected.isEmpty(),
             favorite = null,
+            expanded = null,
             onClick = { onSelect("") },
+            onToggleExpand = {},
             onFavorite = {},
         )
     }
@@ -114,16 +123,28 @@ fun LazyListScope.torCountryList(
             )
         }
     }
-    items(rows, key = { "tor_country:${it.code}" }, contentType = { "tor_country" }) { row ->
-        TorCountryItem(
-            flag = flagOf(row.code),
-            name = row.name,
-            count = row.count,
-            selected = selected.equals(row.code, ignoreCase = true),
-            favorite = row.favorite,
-            onClick = { onSelect(row.code) },
-            onFavorite = { onFavorite(row.code) },
-        )
+    rows.forEach { row ->
+        val isExpanded = expandedCode.equals(row.code, ignoreCase = true)
+        item(key = "tor_country:${row.code}", contentType = "tor_country") {
+            TorCountryItem(
+                flag = flagOf(row.code),
+                name = row.name,
+                count = row.count,
+                selected = selected.equals(row.code, ignoreCase = true),
+                favorite = row.favorite,
+                expanded = isExpanded,
+                onClick = { onSelect(row.code) },
+                onToggleExpand = { onToggleExpand(row.code) },
+                onFavorite = { onFavorite(row.code) },
+            )
+        }
+        if (isExpanded) {
+            serversOf(row.code).forEach { node ->
+                item(key = "tor_server:${node.id}", contentType = "tor_server") {
+                    TorServerItem(node = node, onClick = { onSelectServer(node) })
+                }
+            }
+        }
     }
     item(key = "tor_show_servers", contentType = "tor_button") {
         OutlinedButton(
@@ -142,7 +163,9 @@ private fun TorCountryItem(
     count: Int,
     selected: Boolean,
     favorite: Boolean?,
+    expanded: Boolean?,
     onClick: () -> Unit,
+    onToggleExpand: () -> Unit,
     onFavorite: () -> Unit,
 ) {
     val background = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainer
@@ -151,13 +174,15 @@ private fun TorCountryItem(
             .fillMaxWidth()
             .clip(RoundedCornerShape(20.dp))
             .background(background)
-            .clickable(onClick = onClick)
-            .padding(start = 14.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             if (flag.isEmpty()) name else "$flag  $name",
-            Modifier.weight(1f),
+            Modifier
+                .weight(1f)
+                .clickable(onClick = onClick)
+                .padding(vertical = 10.dp),
             style = MaterialTheme.typography.bodyLarge,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
@@ -176,6 +201,43 @@ private fun TorCountryItem(
                     tint = if (favorite) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+        if (expanded != null) {
+            IconButton(onClick = onToggleExpand, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+/** One server of an expanded country. Tapping it chooses that single server. */
+@Composable
+private fun TorServerItem(node: NodeUiModel, onClick: () -> Unit) {
+    val background = if (node.isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 18.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(background)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            node.name,
+            Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (node.isSelected) {
+            Icon(Icons.Default.Check, contentDescription = null, Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.primary)
         }
     }
 }

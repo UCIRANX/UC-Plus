@@ -180,6 +180,7 @@ import androidx.compose.runtime.mutableStateOf
 
 
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 
 
 
@@ -1611,6 +1612,14 @@ fun LumenApp(
                     val torBridgeType by viewModel.torBridgeType.collectAsStateWithLifecycle()
                     val torCountryCounts by viewModel.torCountryCounts.collectAsStateWithLifecycle()
                     val torFavoriteCountries by viewModel.torFavoriteCountries.collectAsStateWithLifecycle()
+                    val torServersByCountry by viewModel.torServersByCountry.collectAsStateWithLifecycle()
+                    val disabledProtocols by viewModel.disabledProtocols.collectAsStateWithLifecycle()
+                    var torExpandedCode by rememberSaveable { mutableStateOf("") }
+                    // Choosing a Tor country or server means "connect to it". A running tunnel is restarted.
+                    val connectForTorChoice: () -> Unit = {
+                        if (LumenVpnService.isRunning.value || LumenVpnService.isStarting.value) onRestartConnection()
+                        else onToggleConnection()
+                    }
                     val torStrings = LocalStrings.current
                     val torLocale = java.util.Locale.forLanguageTag(torStrings.localeCode)
                     ServerListScreen(
@@ -1636,12 +1645,26 @@ fun LumenApp(
                                 anyLabel = torStrings.torAnyCountry,
                                 showServersLabel = torStrings.torShowServers,
                                 emptyText = torStrings.torNoCountries,
-                                onSelect = viewModel::selectTorCountry,
+                                expandedCode = torExpandedCode,
+                                serversOf = { code -> torServersByCountry[code].orEmpty() },
+                                onSelect = { code ->
+                                    viewModel.selectTorCountry(code)
+                                    connectForTorChoice()
+                                },
+                                onToggleExpand = { code ->
+                                    torExpandedCode = if (torExpandedCode.equals(code, ignoreCase = true)) "" else code
+                                },
+                                onSelectServer = { node ->
+                                    viewModel.selectNode(node)
+                                    connectForTorChoice()
+                                },
                                 onFavorite = viewModel::toggleTorFavoriteCountry,
                                 onShowServers = onShowServers,
                             )
                         },
                         compactGrid = settings.compactServerGrid,
+                        disabledProtocols = disabledProtocols,
+                        onProtocolEnabledChange = viewModel::setProtocolEnabled,
                         selectedGroupFilter = selectedServerFilter,
                         onSelectedGroupFilter = viewModel::selectServerFilter,
 

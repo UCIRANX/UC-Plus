@@ -138,9 +138,31 @@ open class TorRunnerService : Service() {
         return ports
     }
 
+    /**
+     * Copies Tor's GeoIP databases from the app assets into the slot directory, when the build
+     * ships them. Their paths go into the config so the torrc can use them.
+     */
+    private fun installGeoIp(dir: File, cfg: JSONObject) {
+        for (name in listOf("geoip", "geoip6")) {
+            val target = File(dir, name)
+            if (!target.exists()) {
+                runCatching {
+                    assets.open(name).use { input -> target.outputStream().use { input.copyTo(it) } }
+                }.onFailure { target.delete() }
+            }
+        }
+        File(dir, "geoip").takeIf { it.exists() }?.let { cfg.put("geoip_file", it.absolutePath) }
+        File(dir, "geoip6").takeIf { it.exists() }?.let { cfg.put("geoip6_file", it.absolutePath) }
+        if (!File(dir, "geoip").exists() && cfg.optString("exit_country").isNotEmpty()) {
+            com.lumen.core.vpn.VpnLogBus.warning("Tor",
+                "No GeoIP data in this build: the exit country cannot be enforced, the IP may differ.")
+        }
+    }
+
     private fun launchProcess(cfg: JSONObject, lines: List<String>, dir: File, torBin: File) {
         val ports = startTransports(lines)
         val dataDir = File(dir, "data").apply { mkdirs() }
+        installGeoIp(dir, cfg)
         val torrc = File(dir, "torrc")
         torrc.writeText(TorrcBuilder.build(cfg, lines, ports, dataDir))
         val out = File(dir, "stdout.log")

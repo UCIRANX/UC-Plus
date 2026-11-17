@@ -21,6 +21,17 @@ object TorrcBuilder {
         appendLine("ClientOnly 1")
         appendLine("AvoidDiskWrites 1")
         appendLine("SafeLogging 1")
+        // Country lookups need Tor's GeoIP database. Without it, ExitNodes would match nothing,
+        // so the restriction is only written when the database was installed.
+        val geoip = cfg.optString("geoip_file")
+        if (geoip.isNotEmpty()) appendLine("GeoIPFile ${clean(geoip)}")
+        cfg.optString("geoip6_file").takeIf { it.isNotEmpty() }?.let { appendLine("GeoIPv6File ${clean(it)}") }
+        val exit = com.lumen.core.config.tor.TorCountries.normalize(cfg.optString("exit_country"))
+        if (exit.isNotEmpty() && geoip.isNotEmpty()) {
+            // The IP seen on the internet is the exit relay's. Bridges only pick the entry.
+            appendLine("ExitNodes {$exit}")
+            appendLine("StrictNodes 1")
+        }
         if (bridgeLines.isEmpty()) {
             appendLine("UseBridges 0")
         } else {
