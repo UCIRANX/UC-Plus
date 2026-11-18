@@ -145,6 +145,26 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleRelease --no-daemon
 
+      # Report only: lint findings never stop the release. NewApi is the check that matters for minSdk 26.
+      - name: Lint report (report only)
+        continue-on-error: true
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          ./gradlew lintRelease --continue --no-daemon || true
+          mkdir -p lint-report
+          find . -path "*/build/reports/lint-results-release*" -name "*.txt" -exec cp {} lint-report/ \; 2>/dev/null || true
+          echo "### Lint: API levels newer than minSdk 26 (NewApi)" >> "$GITHUB_STEP_SUMMARY"
+          grep -h "NewApi" lint-report/*.txt 2>/dev/null | head -200 >> "$GITHUB_STEP_SUMMARY" || echo "none found" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: lint-report/
+          if-no-files-found: ignore
+
       - name: Publish the release as the latest
         run: |
           set -euo pipefail

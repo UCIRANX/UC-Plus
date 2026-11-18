@@ -13,6 +13,18 @@ import java.net.Socket
 object TorProbe {
     private const val HOST = "connectivitycheck.gstatic.com"
 
+    /** Reads up to [n] bytes, fewer only at the end of the stream. (readNBytes needs API 33; minSdk is 26.) */
+    private fun java.io.InputStream.readExactly(n: Int): ByteArray {
+        val out = ByteArray(n)
+        var got = 0
+        while (got < n) {
+            val read = read(out, got, n - got)
+            if (read < 0) break
+            got += read
+        }
+        return out.copyOf(got)
+    }
+
     fun check(port: Int): Boolean {
         return try {
             Socket().use { s ->
@@ -23,7 +35,7 @@ object TorProbe {
                 // Greeting: SOCKS5, one method, no authentication.
                 out.write(byteArrayOf(5, 1, 0))
                 out.flush()
-                val auth = inp.readNBytes(2)
+                val auth = inp.readExactly(2)
                 if (auth.size < 2 || auth[1].toInt() != 0) return false
                 // CONNECT to the host by name, so Tor resolves it on the exit side.
                 val hostBytes = HOST.toByteArray(Charsets.US_ASCII)
@@ -33,16 +45,16 @@ object TorProbe {
                 req.write(byteArrayOf(0, 80))
                 out.write(req.toByteArray())
                 out.flush()
-                val rep = inp.readNBytes(4)
+                val rep = inp.readExactly(4)
                 if (rep.size < 4 || rep[1].toInt() != 0) return false
                 // Skip the bound address that follows the reply.
                 when (rep[3].toInt()) {
-                    1 -> inp.readNBytes(6)
-                    4 -> inp.readNBytes(18)
+                    1 -> inp.readExactly(6)
+                    4 -> inp.readExactly(18)
                     3 -> {
                         val n = inp.read()
                         if (n < 0) return false
-                        inp.readNBytes(n + 2)
+                        inp.readExactly(n + 2)
                     }
                     else -> return false
                 }
