@@ -148,6 +148,7 @@ jobs:
       # Report only: lint findings never stop the release. NewApi is the check that matters for minSdk 26.
       - name: Lint report (report only)
         continue-on-error: true
+        working-directory: android
         env:
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
@@ -162,7 +163,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lint-report
-          path: lint-report/
+          path: android/lint-report/
           if-no-files-found: ignore
 
       - name: Publish the release as the latest
