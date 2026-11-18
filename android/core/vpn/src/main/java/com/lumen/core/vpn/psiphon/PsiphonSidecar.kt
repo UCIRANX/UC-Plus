@@ -331,8 +331,11 @@ object PsiphonSidecar {
             .put("EmitDiagnosticNotices", true)
             .put("DataRootDirectory", dir.absolutePath)
             .put("RemoteServerListDownloadFilename", File(dir, "psiphon_remote_server_list").absolutePath)
-            // A probe uses the entries it is given and never downloads a list itself.
-            .put("RemoteServerListUrls", if (probe) JSONArray() else remoteServerListUrls())
+            // The core needs one list URL. A probe gets a closed local port instead, so it never
+            // downloads a list; its entries come from the -serverList file.
+            .put("RemoteServerListUrls",
+                if (probe) JSONArray().put(JSONObject().put("URL", encodeUrl("http://127.0.0.1:9/")))
+                else remoteServerListUrls())
             .put("RemoteServerListSignaturePublicKey", SIGNATURE_PUBLIC_KEY)
         // The same four choices as TunnelManager: Conduit, CDN fronting, direct, and auto.
         when (PsiphonPrefs.protocolMode(context)) {

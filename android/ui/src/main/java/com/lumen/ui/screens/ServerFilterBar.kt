@@ -1,7 +1,7 @@
 package com.lumen.ui.screens
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.border
+import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -65,11 +65,13 @@ internal fun ServerFilterBar(
                         text = {
                             // The name chooses the protocol section; the box only decides whether it is listed.
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(label,
-                                    Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                        .border(1.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(8.dp)),
-                                    fontWeight = if (protocol == id) FontWeight.Bold else FontWeight.Normal)
-                                Spacer(Modifier.weight(1f))
+                                Box(Modifier.weight(1f)) {
+                                    Text(label,
+                                        Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                            RoundedCornerShape(6.dp))
+                                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                                        fontWeight = FontWeight.Bold)
+                                }
                                 Icon(Icons.Default.KeyboardArrowDown, null, Modifier.size(18.dp),
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 if (id.equals("psiphon", ignoreCase = true) && onOpenPsiphonScan != null) {

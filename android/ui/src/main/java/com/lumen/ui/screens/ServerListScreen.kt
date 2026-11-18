@@ -392,14 +392,6 @@ fun ServerListScreen(
                 contentPadding = PaddingValues(bottom = 100.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (torOn) item(key = "tor_any_country", contentType = "tor_country") {
-                    TorCountryRowView(
-                        flag = "🌐", name = torAnyLabel, subtitle = "Tor", count = torRows.sumOf { it.count },
-                        ping = null, showPing = false, selected = torSelectedCountry == "",
-                        favorite = null, expanded = null,
-                        onClick = { onTorSelectCountry("") }, onToggleExpand = {}, onFavorite = {},
-                    )
-                }
                 run {
                 item(key = "server_overview", contentType = "overview") {
             // 3. Subscription Provider Banner (if present and filter matches)
@@ -608,7 +600,7 @@ fun ServerListScreen(
                         torRow = { node ->
                             val info = node.torCountry
                             if (info != null) TorCountryRowView(
-                                flag = CountryFlagHelper.getServerFlagEmoji(node.countryCode),
+                                flag = if (node.countryCode.isEmpty()) "🌐" else CountryFlagHelper.getServerFlagEmoji(node.countryCode),
                                 name = node.name,
                                 subtitle = "Tor",
                                 count = info.count,

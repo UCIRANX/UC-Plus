@@ -254,6 +254,16 @@ internal fun selectedAppsFirst(
     )
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
+    // Startup timing: milliseconds from process start to each stage, written to the app log.
+    private val processStartMs = android.os.Process.getStartElapsedRealtime()
+    private var startupStages = 0
+
+    fun logStartup(stage: String) {
+        if (startupStages >= 6) return
+        startupStages++
+        log("Startup: $stage at ${android.os.SystemClock.elapsedRealtime() - processStartMs} ms")
+    }
+
     private val sessionOpenVpnSecrets = java.util.concurrent.ConcurrentHashMap<String, com.lumen.core.config.parser.OpenVpnSecrets>()
 
     private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
