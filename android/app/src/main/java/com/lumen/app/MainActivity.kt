@@ -90,26 +90,11 @@ class MainActivity : ComponentActivity() {
         val splash = installSplashScreen()
         applySystemBarStyle(dark = !startupLight)
         super.onCreate(savedInstanceState)
+        // No exit animation: the splash is removed at once, so the app opens straight away.
         splash.setOnExitAnimationListener { provider ->
-            // core-splashscreen applies Theme.Lumen's windowLightStatusBar (false: Material dark)
-            // right before this listener and again in remove(); restore the palette's bar style
-            // both times, or the icons flash white over the light theme.
             systemBarsDark?.let(::applySystemBarStyle)
-            if (launchBackground != 0) provider.view.setBackgroundColor(launchBackground)
-            // Android can hand over a splash without an icon (notably on warm API 37
-            // launches). The compat accessor asserts non-null before our safe cast.
-            (runCatching { provider.iconView }.getOrNull() as? android.widget.ImageView)?.drawable?.setTint(launchInk)
-            val elapsed = android.os.SystemClock.uptimeMillis() - runCatching { provider.iconAnimationStartMillis }.getOrDefault(0L)
-            val remaining = if (android.animation.ValueAnimator.areAnimatorsEnabled())
-                (runCatching { provider.iconAnimationDurationMillis }.getOrDefault(0L) - elapsed).coerceIn(0L, 620L) else 0L
-            provider.view.animate().alpha(0f).setStartDelay(remaining).setDuration(180L)
-                .withEndAction {
-                    provider.remove()
-                    // On API 31+ core-splashscreen's remove() re-applies the activity theme's
-                    // windowLightStatusBar (false: Theme.Lumen is Material dark), which turned the
-                    // status-bar icons white over the light theme until the theme was toggled.
-                    systemBarsDark?.let(::applySystemBarStyle)
-                }.start()
+            provider.remove()
+            systemBarsDark?.let(::applySystemBarStyle)
         }
 
         handleIntent(intent)

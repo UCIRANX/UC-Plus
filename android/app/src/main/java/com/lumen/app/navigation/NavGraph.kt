@@ -1658,7 +1658,7 @@ fun LumenApp(
                         torSelectedCountry = torHighlight,
                         torExpandedCode = torExpandedCode,
                         torServersOf = { code -> torServersByCountry[code].orEmpty() },
-                        torAnyLabel = torStrings.torAnyCountry,
+                        torAnyLabel = "Tor Auto",
                         onTorSelectCountry = { code ->
                             viewModel.selectTorCountry(code)
                             restartIfRunningForTorChoice()

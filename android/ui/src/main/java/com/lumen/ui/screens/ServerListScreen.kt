@@ -110,7 +110,16 @@ fun serverSortComparator(sort: ServerSort): Comparator<NodeUiModel> = when (sort
 }
 
 /** Display order of protocol groups: Amnezia, then OpenVPN, then SSTP, then everything else. */
-private val PROTOCOL_DISPLAY_ORDER = listOf(setOf("awg", "amneziawg", "amnezia"), setOf("openvpn"), setOf("sstp"))
+private val PROTOCOL_DISPLAY_ORDER = listOf(
+    setOf("awg", "amneziawg", "amnezia"),
+    setOf("psiphon"),
+    setOf("tor"),
+    setOf("sstp"),
+    setOf("openvpn"),
+    setOf("shadowsocks", "ss"),
+    setOf("vless"),
+    setOf("hysteria2", "hysteria", "hy2"),
+)
 
 internal fun protocolRank(key: String): Int =
     PROTOCOL_DISPLAY_ORDER.indexOfFirst { key in it }.let { if (it < 0) PROTOCOL_DISPLAY_ORDER.size else it }
@@ -383,7 +392,7 @@ fun ServerListScreen(
                 contentPadding = PaddingValues(bottom = 100.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (torOn && protocol.equals("tor", ignoreCase = true)) item(key = "tor_any_country", contentType = "tor_country") {
+                if (torOn) item(key = "tor_any_country", contentType = "tor_country") {
                     TorCountryRowView(
                         flag = "🌐", name = torAnyLabel, subtitle = "Tor", count = torRows.sumOf { it.count },
                         ping = null, showPing = false, selected = torSelectedCountry == "",

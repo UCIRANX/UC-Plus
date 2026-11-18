@@ -3,8 +3,6 @@
     <style name="Theme.Lumen.Starting" parent="Theme.SplashScreen">
         <item name="lumenSplashInk">@color/lumen_splash_ink</item>
         <item name="windowSplashScreenBackground">@color/lumen_splash_background</item>
-        <item name="windowSplashScreenAnimatedIcon">@drawable/lumen_splash_animated</item>
-        <item name="windowSplashScreenAnimationDuration">620</item>
         <item name="postSplashScreenTheme">@style/Theme.Lumen</item>
     </style>
     <style name="Theme.Lumen" parent="android:Theme.Material.NoActionBar">

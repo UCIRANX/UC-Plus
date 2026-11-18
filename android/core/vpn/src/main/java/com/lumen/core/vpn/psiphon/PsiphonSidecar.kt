@@ -192,16 +192,23 @@ object PsiphonSidecar {
                 "-dataRootDirectory", dir.absolutePath, "-serverList", entryFile.absolutePath,
             ).directory(dir).redirectErrorStream(true).start()
         } catch (e: IOException) {
+            VpnLogBus.warning(TAG, "probe ${region.ifEmpty { "auto" }} could not start: ${e.message}")
             return -1
         }
+        val label = region.ifEmpty { "auto" }
         val tunnelUp = CompletableDeferred<Unit>()
         val began = System.nanoTime()
+        var reported = 0
         Thread({
             try {
                 BufferedReader(InputStreamReader(started.inputStream, Charsets.UTF_8)).use { reader ->
                     while (true) {
                         val line = reader.readLine() ?: break
                         if (isTunnelUpNotice(line)) tunnelUp.complete(Unit)
+                        else if (reported < 6) probeProblem(line)?.let {
+                            reported++
+                            VpnLogBus.warning(TAG, "probe $label: $it")
+                        }
                     }
                 }
             } catch (_: IOException) {
@@ -217,7 +224,9 @@ object PsiphonSidecar {
                 tunnelUp.await()
                 true
             }
-            if (up == true) ((System.nanoTime() - began) / 1_000_000).toInt() else -1
+            val ms = if (up == true) ((System.nanoTime() - began) / 1_000_000).toInt() else -1
+            VpnLogBus.info(TAG, "probe $label: " + (if (ms > 0) "$ms ms" else "no tunnel in time"))
+            ms
         } catch (e: IOException) {
             -1
         } finally {
@@ -227,6 +236,14 @@ object PsiphonSidecar {
                 if (started.isAlive) started.destroyForcibly()
             }
         }
+    }
+
+    /** The text worth logging from a core line: a non-JSON line, or an Error notice's message. */
+    private fun probeProblem(line: String): String? {
+        if (line.isBlank()) return null
+        val notice = runCatching { JSONObject(line) }.getOrNull() ?: return line.take(300)
+        if (notice.optString("noticeType") != "Error") return null
+        return (notice.optJSONObject("data") ?: JSONObject()).optString("message").take(300).takeIf { it.isNotEmpty() }
     }
 
     private fun isTunnelUpNotice(line: String): Boolean {

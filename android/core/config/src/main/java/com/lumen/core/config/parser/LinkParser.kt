@@ -1472,8 +1472,14 @@ object LinkParser {
             "protocol" to "socks",
             "settings" to mapOf("servers" to listOf(mapOf("address" to "127.0.0.1", "port" to psiphon.SOCKS_PORT)))
         )
+        // Auto is always "Psiphon Auto"; a region shows its full country name unless the link gives a real label.
+        val name = when {
+            region.isEmpty() -> "Psiphon Auto"
+            else -> label.takeIf { it.isNotBlank() && !it.equals(region, ignoreCase = true) }
+                ?: java.util.Locale("", region).displayCountry.takeIf { it.isNotBlank() } ?: region
+        }
         return ParsedNode(
-            name = label.ifEmpty { "Psiphon $code" }, scheme = "psiphon",
+            name = name, scheme = "psiphon",
             server = "127.0.0.1", port = psiphon.SOCKS_PORT,
             link = "psiphon://$code", outbound = outbound,
         )
