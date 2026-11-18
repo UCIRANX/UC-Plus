@@ -99,92 +99,17 @@ data class TorServerActions(
 )
 
 /**
- * The Tor country list, drawn like the other servers: flag badge, country name, then a subtitle
- * "Tor - bridge type - ping - servers". The heart keeps its place; the arrow sits after it and opens
- * the servers of that country. [selectedCountry] is null when no Tor choice is the active config, and
- * "" for "any country". [includeAny] is false in the all-protocols list.
+ * A Tor country row, drawn like the other servers: flag badge, country name, then "Tor ping count".
+ * The arrow sits left of the heart; the heart stays on the right as in the other rows.
  */
-fun LazyListScope.torCountryList(
-    rows: List<TorCountryRow>,
-    selectedCountry: String?,
-    totalCount: Int,
-    anyLabel: String,
-    bridgeLabel: String,
-    emptyText: String,
-    includeAny: Boolean,
-    expandedCode: String,
-    serversOf: (String) -> List<NodeUiModel>,
-    actions: TorServerActions,
-    onSelect: (String) -> Unit,
-    onToggleExpand: (String) -> Unit,
-    onFavorite: (String) -> Unit,
-) {
-    if (includeAny) item(key = "tor_any_country", contentType = "tor_country") {
-        TorCountryItem(
-            flag = "🌐",
-            name = anyLabel,
-            subtitle = "Tor - $bridgeLabel",
-            count = totalCount,
-            ping = null,
-            selected = selectedCountry == "",
-            favorite = null,
-            expanded = null,
-            onClick = { onSelect("") },
-            onToggleExpand = {},
-            onFavorite = {},
-        )
-    }
-    if (rows.isEmpty()) {
-        item(key = "tor_no_countries", contentType = "tor_empty") {
-            Text(
-                emptyText,
-                Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-    rows.forEach { row ->
-        val isExpanded = expandedCode.equals(row.code, ignoreCase = true)
-        item(key = "tor_country:${row.code}", contentType = "tor_country") {
-            TorCountryItem(
-                flag = CountryFlagHelper.getServerFlagEmoji(row.code),
-                name = row.name,
-                subtitle = "Tor - $bridgeLabel",
-                count = row.count,
-                ping = row.pingMs,
-                selected = selectedCountry.equals(row.code, ignoreCase = true),
-                favorite = row.favorite,
-                expanded = isExpanded,
-                onClick = { onSelect(row.code) },
-                onToggleExpand = { onToggleExpand(row.code) },
-                onFavorite = { onFavorite(row.code) },
-            )
-        }
-        if (isExpanded) {
-            serversOf(row.code).forEach { node ->
-                item(key = "tor_server:${node.id}", contentType = "tor_server") {
-                    TorServerItem(
-                        node = node,
-                        onClick = { actions.onSelect(node) },
-                        onPing = { actions.onPing(node) },
-                        onCopy = { actions.onCopy(node) },
-                        onExportQr = { actions.onExportQr(node) },
-                        onDelete = { actions.onDelete(node) },
-                    )
-                }
-            }
-        }
-    }
-}
-
 @Composable
-private fun TorCountryItem(
+internal fun TorCountryRowView(
     flag: String,
     name: String,
     subtitle: String,
     count: Int,
     ping: Int?,
+    showPing: Boolean,
     selected: Boolean,
     favorite: Boolean?,
     expanded: Boolean?,
@@ -196,11 +121,7 @@ private fun TorCountryItem(
     val bg = if (selected) art.stage else MaterialTheme.colorScheme.surfaceContainerLow
     val textPrimary = if (selected) art.onStage else MaterialTheme.colorScheme.onSurface
     val textMuted = textPrimary.copy(alpha = .75f)
-    val pingText = when {
-        ping != null && ping > 0 -> "$ping ms"
-        ping != null -> "--"
-        else -> "--"
-    }
+    val pingText = if (ping != null && ping > 0) "$ping ms" else "--"
     val pingTint = if (ping != null && ping > 0) pingColor(ping, bg) else textMuted
     Row(
         Modifier
@@ -233,9 +154,12 @@ private fun TorCountryItem(
             Spacer(Modifier.height(2.dp))
             Text(
                 buildAnnotatedString {
-                    append("$subtitle - ")
-                    withStyle(SpanStyle(color = pingTint, fontFamily = LumenMono)) { append(pingText) }
-                    append(" - $count")
+                    append(subtitle)
+                    if (showPing) {
+                        append("  ")
+                        withStyle(SpanStyle(color = pingTint, fontFamily = LumenMono)) { append(pingText) }
+                    }
+                    append("  $count")
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = textMuted,
@@ -243,21 +167,21 @@ private fun TorCountryItem(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (favorite != null) {
-            IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
-                Icon(
-                    if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                    contentDescription = null,
-                    tint = if (favorite) MaterialTheme.colorScheme.error else textMuted,
-                )
-            }
-        }
         if (expanded != null) {
             IconButton(onClick = onToggleExpand, modifier = Modifier.size(36.dp)) {
                 Icon(
                     if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
                     contentDescription = null,
                     tint = textMuted,
+                )
+            }
+        }
+        if (favorite != null) {
+            IconButton(onClick = onFavorite, modifier = Modifier.size(36.dp)) {
+                Icon(
+                    if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    contentDescription = null,
+                    tint = if (favorite) MaterialTheme.colorScheme.error else textMuted,
                 )
             }
         }
@@ -271,7 +195,7 @@ private fun TorCountryItem(
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TorServerItem(
+internal fun TorServerItem(
     node: NodeUiModel,
     onClick: () -> Unit,
     onPing: () -> Unit,

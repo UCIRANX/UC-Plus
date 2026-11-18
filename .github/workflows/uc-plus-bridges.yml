@@ -5,12 +5,12 @@ name: UC Plus Tor bridges
 # tor-countries.txt and geo/<cc>.geoip to the "bridges" branch. The app reads those files.
 #
 # Run it on demand: Actions -> "UC Plus Tor bridges" -> "Run workflow".
-# It also runs every hour on its own.
+# It also runs every 6 hours on its own.
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: write

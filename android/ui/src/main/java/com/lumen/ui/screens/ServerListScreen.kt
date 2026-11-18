@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyItemScope
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -175,7 +176,14 @@ fun ServerListScreen(
     onSelectedGroupFilter: (String) -> Unit = {},
     torControls: @Composable (String) -> Unit = {},
     // Tor only: the country list shown instead of the rows. It gets a callback that shows every server.
-    torCountries: (LazyListScope.(TorServerActions, Boolean) -> Unit)? = null,
+    torRows: List<TorCountryRow> = emptyList(),
+    torSelectedCountry: String? = null,
+    torExpandedCode: String = "",
+    torServersOf: (String) -> List<NodeUiModel> = { emptyList() },
+    torAnyLabel: String = "",
+    onTorSelectCountry: (String) -> Unit = {},
+    onTorToggleExpand: (String) -> Unit = {},
+    onTorFavorite: (String) -> Unit = {},
     disabledProtocols: Set<String> = emptySet(),
     onProtocolEnabledChange: (String, Boolean) -> Unit = { _, _ -> }
 ) {
@@ -211,9 +219,6 @@ fun ServerListScreen(
     var showPingModeDialog by remember { mutableStateOf(false) }
     val uriHandler = LocalUriHandler.current
     var protocol by remember { mutableStateOf("") }
-    // Tor shows countries first; this switches to the full server rows and back.
-    var torShowServers by remember { mutableStateOf(false) }
-    LaunchedEffect(protocol) { torShowServers = false }
     var reachablePref by if (persistPreferences) rememberUiPreference("servers_filter_reachable", "0") else remember { mutableStateOf("0") }
     val onlyReachable = reachablePref == "1"
     var countryPref by if (persistPreferences) rememberUiPreference("servers_group_by_country", "0") else remember { mutableStateOf("0") }
@@ -232,21 +237,27 @@ fun ServerListScreen(
     }
     BackHandler(enabled = selectedIds.isNotEmpty()) { selectedIds = emptySet() }
 
+    // Tor servers are listed by country. Each country is an entry that sorts with the other rows,
+    // and its servers appear under it when its arrow is open.
+    val torOn = protocol.equals("tor", ignoreCase = true) || (protocol.isBlank() && "tor" !in disabledProtocols)
+    val displayNodes: List<NodeUiModel> = remember(nodes, torRows, torSelectedCountry, torExpandedCode, protocol, disabledProtocols) {
+        if (!torOn) nodes else nodes.filterNot { protocolKey(it) == "tor" } +
+            torRows.map { torCountryNode(it, torSelectedCountry, torExpandedCode) }
+    }
     val query = ServerListQuery(selectedFilter, searchQuery, protocol, onlyReachable, currentSort, maxPing, groupByCountry,
         disabledProtocols)
-    val prepared by rememberPreparedServerList(nodes, query)
-    val preparing = prepared.source !== nodes || prepared.query != query
+    val prepared by rememberPreparedServerList(displayNodes, query)
+    val preparing = prepared.source !== displayNodes || prepared.query != query
     val manualNodesCount = prepared.manualCount
     // Keep rows during a ping refresh; never display another group's rows after switching groups.
     val filteredNodes = if (prepared.query.group == selectedFilter) prepared.visible else emptyList()
     // All-protocols ping skips unchecked protocols, favourites included. Inside a protocol's own
     // section its servers are pinged, even when that protocol is unchecked.
-    fun pingTargets(list: List<NodeUiModel>): List<NodeUiModel> =
-        if (protocol.isBlank()) list.filter { protocolKey(it) !in disabledProtocols || it.isFavorite } else list
-    // In the all-protocols list, Tor servers are shown as their countries instead of one by one.
-    val torBlockShown = torCountries != null && protocol.isBlank() &&
-        "tor" !in disabledProtocols && nodes.any { protocolKey(it) == "tor" }
-    val listedNodes = if (torBlockShown) filteredNodes.filterNot { protocolKey(it) == "tor" } else filteredNodes
+    // A Tor country entry pings all of its servers.
+    fun pingTargets(list: List<NodeUiModel>): List<NodeUiModel> {
+        val expanded = list.flatMap { node -> if (node.torCountry != null) torServersOf(node.countryCode) else listOf(node) }
+        return if (protocol.isBlank()) expanded.filter { protocolKey(it) !in disabledProtocols || it.isFavorite } else expanded
+    }
     val torActions = TorServerActions(
         onSelect = selectServer,
         onPing = onPingNode,
@@ -347,7 +358,8 @@ fun ServerListScreen(
             }
 
             ServerFilterBar(
-                protocol, prepared.protocols, { protocol = it },
+                protocol, (prepared.protocols + listOfNotNull("tor".takeIf { nodes.any { protocolKey(it) == "tor" } }))
+                    .distinct().sortedWith(compareBy<String> { protocolRank(it) }.thenBy { it }), { protocol = it },
                 groupByCountry, { countryPref = if (it) "1" else "0" },
                 onlyReachable, { reachablePref = if (it) "1" else "0" }, maxPing, { maxPingPref = it.toString() },
                 onReset = { protocol = ""; reachablePref = "0"; countryPref = "0"; maxPingPref = "0" },
@@ -363,20 +375,20 @@ fun ServerListScreen(
             torControls(protocol)
 
             // 5. Server List (for Tor: the country list until "show servers" is chosen)
-            val torCountryMode = torCountries != null && protocol.equals("tor", ignoreCase = true) && !torShowServers
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 100.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (torCountryMode) {
-                    torCountries?.invoke(this, torActions, true)
-                } else {
-                if (torCountries != null && protocol.equals("tor", ignoreCase = true)) {
-                    item(key = "tor_back_to_countries", contentType = "tor_button") {
-                        TextButton(onClick = { torShowServers = false }) { Text(strings.torBackToCountries) }
-                    }
+                if (torOn && protocol.equals("tor", ignoreCase = true)) item(key = "tor_any_country", contentType = "tor_country") {
+                    TorCountryRowView(
+                        flag = "🌐", name = torAnyLabel, subtitle = "Tor", count = torRows.sumOf { it.count },
+                        ping = null, showPing = false, selected = torSelectedCountry == "",
+                        favorite = null, expanded = null,
+                        onClick = { onTorSelectCountry("") }, onToggleExpand = {}, onFavorite = {},
+                    )
                 }
+                run {
                 item(key = "server_overview", contentType = "overview") {
             // 3. Subscription Provider Banner (if present and filter matches)
             if (activeSub != null && selectedFilter != "manual") {
@@ -538,57 +550,79 @@ fun ServerListScreen(
                         }
                     }
                 }
-                // Without grouping, the Tor countries go right after the last SSTP row (or at the end
-                // when there is none). Grouped by country, they go at the end.
-                val lastSstp = listedNodes.indexOfLast { protocolKey(it) == "sstp" }
-                val splitAt = if (lastSstp < 0) listedNodes.size else lastSstp + 1
                 val sections: List<Pair<String, List<NodeUiModel>>> = if (groupByCountry) {
-                    listedNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }.map { it.key to it.value }
-                } else listOf("" to listedNodes.take(splitAt), "" to listedNodes.drop(splitAt))
-                val torSlot = if (groupByCountry) sections.size else 1
-                sections.forEachIndexed { index, (country, sectionNodes) ->
-                    if (torBlockShown && index == torSlot) torCountries?.invoke(this, torActions, false)
+                    filteredNodes.groupBy { countryCodeOf(it).ifBlank { "—" } }.map { it.key to it.value }
+                } else listOf("" to filteredNodes)
+                sections.forEach { (country, sectionNodes) ->
                     if (country.isNotBlank()) item(key = "country:$country", contentType = "country") {
                         Text("${CountryFlagHelper.getFlagEmoji(country)}  $country · ${sectionNodes.size}",
                             Modifier.padding(horizontal = 8.dp, vertical = 10.dp), style = MaterialTheme.typography.labelLarge)
                     }
-                if (compactGrid) {
-                    items(sectionNodes.chunked(3), key = { row -> "grid:" + row.joinToString { it.id } }, contentType = { "server_grid" }) { row ->
-                        Row(Modifier.fillMaxWidth().animateItem(fadeInSpec = null, fadeOutSpec = null),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            row.forEach { node ->
-                                CompactServerCard(if (pendingSelectedId != null) node.copy(isSelected = node.id == pendingSelectedId) else node,
-                                    node.id in selectedIds, node.id in pingingNodeIds || testingNodeId == node.id,
-                                    onClick = {
-                                        if (selectedIds.isEmpty()) selectServer(node)
-                                        else selectedIds = if (node.id in selectedIds) selectedIds - node.id else selectedIds + node.id
-                                    }, onLongClick = { selectedIds = selectedIds + node.id },
-                                    onEdit = { onEditNode(node) }, onPing = { onPingNode(node) },
-                                    onCopy = { onCopyNodeLink(node) }, onExportLumen = { onExportLumen(node) },
-                                    onDelete = { deletingNode = node }, modifier = Modifier.weight(1f),
-                                    onFavorite = { onToggleFavorite(node) })
+                    serverRunItems(
+                        sectionNodes, compactGrid,
+                        gridRow = { row ->
+                            Row(Modifier.fillMaxWidth().animateItem(fadeInSpec = null, fadeOutSpec = null),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                row.forEach { node ->
+                                    CompactServerCard(if (pendingSelectedId != null) node.copy(isSelected = node.id == pendingSelectedId) else node,
+                                        node.id in selectedIds, node.id in pingingNodeIds || testingNodeId == node.id,
+                                        onClick = {
+                                            if (selectedIds.isEmpty()) selectServer(node)
+                                            else selectedIds = if (node.id in selectedIds) selectedIds - node.id else selectedIds + node.id
+                                        }, onLongClick = { selectedIds = selectedIds + node.id },
+                                        onEdit = { onEditNode(node) }, onPing = { onPingNode(node) },
+                                        onCopy = { onCopyNodeLink(node) }, onExportLumen = { onExportLumen(node) },
+                                        onDelete = { deletingNode = node }, modifier = Modifier.weight(1f),
+                                        onFavorite = { onToggleFavorite(node) })
+                                }
+                                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
                             }
-                            repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
-                        }
-                    }
-                } else items(sectionNodes, key = { it.id }, contentType = { "server" }) { node ->
-                    ServerListRow(if (pendingSelectedId != null) node.copy(isSelected = node.id == pendingSelectedId) else node, node.id in selectedIds,
-                        node.id in pingingNodeIds || testingNodeId == node.id,
-                        serverTestResults[node.id],
-                        onClick = { clicked ->
-                            if (selectedIds.isEmpty()) selectServer(clicked)
-                            else selectedIds = if (clicked.id in selectedIds) selectedIds - clicked.id else selectedIds + clicked.id
                         },
-                        onLongClick = { selectedIds = selectedIds + it.id },
-                        onEditNode = onEditNode, onPingNode = onPingNode,
-                        onCopyNodeLink = onCopyNodeLink, onExportQrCode = onExportQrCode, onExportLumen = onExportLumen,
-                        onMove = { movingNodes = listOf(it) }, onDeleteNode = { deletingNode = it },
-                        onToggleFavorite = onToggleFavorite,
-                        modifier = Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null))
+                        listRow = { node ->
+                            ServerListRow(if (pendingSelectedId != null) node.copy(isSelected = node.id == pendingSelectedId) else node, node.id in selectedIds,
+                                node.id in pingingNodeIds || testingNodeId == node.id,
+                                serverTestResults[node.id],
+                                onClick = { clicked ->
+                                    if (selectedIds.isEmpty()) selectServer(clicked)
+                                    else selectedIds = if (clicked.id in selectedIds) selectedIds - clicked.id else selectedIds + clicked.id
+                                },
+                                onLongClick = { selectedIds = selectedIds + it.id },
+                                onEditNode = onEditNode, onPingNode = onPingNode,
+                                onCopyNodeLink = onCopyNodeLink, onExportQrCode = onExportQrCode, onExportLumen = onExportLumen,
+                                onMove = { movingNodes = listOf(it) }, onDeleteNode = { deletingNode = it },
+                                onToggleFavorite = onToggleFavorite,
+                                modifier = Modifier.animateItem(fadeInSpec = null, fadeOutSpec = null))
+                        },
+                        torRow = { node ->
+                            val info = node.torCountry
+                            if (info != null) TorCountryRowView(
+                                flag = CountryFlagHelper.getServerFlagEmoji(node.countryCode),
+                                name = node.name,
+                                subtitle = "Tor",
+                                count = info.count,
+                                ping = node.pingMs,
+                                showPing = true,
+                                selected = info.selected,
+                                favorite = node.isFavorite,
+                                expanded = info.expanded,
+                                onClick = { onTorSelectCountry(node.countryCode) },
+                                onToggleExpand = { onTorToggleExpand(node.countryCode) },
+                                onFavorite = { onTorFavorite(node.countryCode) },
+                            )
+                        },
+                        torChild = { child ->
+                            TorServerItem(
+                                node = child,
+                                onClick = { torActions.onSelect(child) },
+                                onPing = { torActions.onPing(child) },
+                                onCopy = { torActions.onCopy(child) },
+                                onExportQr = { torActions.onExportQr(child) },
+                                onDelete = { torActions.onDelete(child) },
+                            )
+                        },
+                        childrenOf = torServersOf,
+                    )
                 }
-
-                }
-                if (torBlockShown && torSlot >= sections.size) torCountries?.invoke(this, torActions, false)
                 item(key = "server_footer", contentType = "spacer") {
                     Spacer(modifier = Modifier.height(16.dp))
                 }
@@ -840,4 +874,62 @@ private fun ServerListRow(
                         }
                     }
 
+}
+
+/** A Tor country as a list entry. Its id is not a real server; taps and pings are routed by [torCountry]. */
+private fun torCountryNode(row: TorCountryRow, selected: String?, expandedCode: String): NodeUiModel = NodeUiModel(
+    id = "tor-country:${row.code}",
+    name = row.name,
+    protocol = "tor",
+    server = "",
+    port = 0,
+    pingMs = row.pingMs,
+    countryCode = row.code,
+    isFavorite = row.favorite,
+    displayProtocol = "Tor",
+    torCountry = TorCountryInfo(
+        count = row.count,
+        selected = selected.equals(row.code, ignoreCase = true),
+        expanded = expandedCode.equals(row.code, ignoreCase = true),
+    ),
+)
+
+/**
+ * Lays out one section. Plain servers go in rows (three per row in grid mode). A Tor country is one
+ * row, and when it is open its servers follow it.
+ */
+private fun LazyListScope.serverRunItems(
+    nodes: List<NodeUiModel>,
+    compactGrid: Boolean,
+    gridRow: @Composable LazyItemScope.(List<NodeUiModel>) -> Unit,
+    listRow: @Composable LazyItemScope.(NodeUiModel) -> Unit,
+    torRow: @Composable (NodeUiModel) -> Unit,
+    torChild: @Composable (NodeUiModel) -> Unit,
+    childrenOf: (String) -> List<NodeUiModel>,
+) {
+    var run = mutableListOf<NodeUiModel>()
+    fun flush() {
+        if (run.isEmpty()) return
+        if (compactGrid) {
+            items(run.chunked(3), key = { row -> "grid:" + row.joinToString { it.id } }, contentType = { "server_grid" }) { row ->
+                gridRow(row)
+            }
+        } else {
+            items(run, key = { it.id }, contentType = { "server" }) { node -> listRow(node) }
+        }
+        run = mutableListOf()
+    }
+    for (node in nodes) {
+        val info = node.torCountry
+        if (info == null) {
+            run.add(node)
+            continue
+        }
+        flush()
+        item(key = node.id, contentType = "tor_country") { torRow(node) }
+        if (info.expanded) childrenOf(node.countryCode).forEach { child ->
+            item(key = "tor_server:${child.id}", contentType = "tor_server") { torChild(child) }
+        }
+    }
+    flush()
 }

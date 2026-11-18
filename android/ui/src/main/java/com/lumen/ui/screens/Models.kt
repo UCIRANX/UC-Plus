@@ -25,8 +25,14 @@ data class NodeUiModel(
     val groupId: String? = null,
     val isProtected: Boolean = false,
     val isFavorite: Boolean = false,
-    val displayProtocol: String = protocol.uppercase()
+    val displayProtocol: String = protocol.uppercase(),
+    // Set only on a Tor country entry in the server list (not a real server).
+    val torCountry: TorCountryInfo? = null
 )
+
+/** State of a Tor country entry: how many servers it has, whether it is the active choice, and if it is open. */
+@Immutable
+data class TorCountryInfo(val count: Int, val selected: Boolean, val expanded: Boolean)
 
 @Immutable
 data class SubscriptionUiModel(

@@ -425,7 +425,6 @@ import com.lumen.ui.screens.ImportPhaseUi
 import com.lumen.ui.screens.LocalStrings
 import com.lumen.ui.screens.TorControlsCard
 import com.lumen.ui.screens.TorCountryRow
-import com.lumen.ui.screens.torCountryList
 import com.lumen.core.config.tor.TorBridges
 import com.lumen.core.config.tor.TorCountries
 import com.lumen.ui.components.ConnectionState
@@ -1617,6 +1616,7 @@ fun LumenApp(
                     // config from another section makes the old Tor highlight disappear.
                     val torSelectedActive = nodes.any { it.isSelected && it.protocol.equals("tor", ignoreCase = true) }
                     val torHighlight: String? = if (torSelectedActive && !torPicked) torCountry else null
+                    }
                     val torServersByCountry by viewModel.torServersByCountry.collectAsStateWithLifecycle()
                     val disabledProtocols by viewModel.disabledProtocols.collectAsStateWithLifecycle()
                     var torExpandedCode by rememberSaveable { mutableStateOf("") }
@@ -1628,6 +1628,16 @@ fun LumenApp(
                     }
                     val torStrings = LocalStrings.current
                     val torLocale = java.util.Locale.forLanguageTag(torStrings.localeCode)
+                    // Rows for the server list, recomputed only when the Tor data changes so the list does
+                    // not re-sort on unrelated recompositions.
+                    val torRows = remember(torCountryCounts, torServersByCountry, torFavoriteCountries, torLocale) {
+                        torCountryCounts.map { (code, count) ->
+                            val best = torServersByCountry[code].orEmpty()
+                                .mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }
+                                .minOrNull()
+                            TorCountryRow(code, TorCountries.name(code, torLocale), count,
+                                code in torFavoriteCountries, best)
+                        }
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
                         torControls = { protocol ->
@@ -1640,40 +1650,19 @@ fun LumenApp(
                                 )
                             }
                         },
-                        torCountries = { actions, includeAny ->
-                            val rows = torCountryCounts.map { (code, count) ->
-                                val best = torServersByCountry[code].orEmpty()
-                                    .mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }
-                                    .minOrNull()
-                                TorCountryRow(code, TorCountries.name(code, torLocale), count,
-                                    code in torFavoriteCountries, best)
-                            }.sortedWith(
-                                compareByDescending<TorCountryRow> { it.favorite }
-                                    .thenBy { it.pingMs ?: Int.MAX_VALUE }
-                                    .thenBy { it.name }
-                            )
-                            torCountryList(
-                                rows = rows,
-                                selectedCountry = torHighlight,
-                                totalCount = torCountryCounts.values.sum(),
-                                anyLabel = torStrings.torAnyCountry,
-                                bridgeLabel = if (torBridgeType == "auto") torStrings.torTypeAuto
-                                    else TorBridges.label(torBridgeType),
-                                emptyText = torStrings.torNoCountries,
-                                includeAny = includeAny,
-                                expandedCode = torExpandedCode,
-                                serversOf = { code -> torServersByCountry[code].orEmpty() },
-                                actions = actions,
-                                onSelect = { code ->
-                                    viewModel.selectTorCountry(code)
-                                    restartIfRunningForTorChoice()
-                                },
-                                onToggleExpand = { code ->
-                                    torExpandedCode = if (torExpandedCode.equals(code, ignoreCase = true)) "" else code
-                                },
-                                onFavorite = viewModel::toggleTorFavoriteCountry,
-                            )
+                        torRows = torRows,
+                        torSelectedCountry = torHighlight,
+                        torExpandedCode = torExpandedCode,
+                        torServersOf = { code -> torServersByCountry[code].orEmpty() },
+                        torAnyLabel = torStrings.torAnyCountry,
+                        onTorSelectCountry = { code ->
+                            viewModel.selectTorCountry(code)
+                            restartIfRunningForTorChoice()
                         },
+                        onTorToggleExpand = { code ->
+                            torExpandedCode = if (torExpandedCode.equals(code, ignoreCase = true)) "" else code
+                        },
+                        onTorFavorite = viewModel::toggleTorFavoriteCountry,
                         compactGrid = settings.compactServerGrid,
                         disabledProtocols = disabledProtocols,
                         onProtocolEnabledChange = viewModel::setProtocolEnabled,
