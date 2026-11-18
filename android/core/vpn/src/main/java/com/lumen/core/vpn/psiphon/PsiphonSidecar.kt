@@ -19,9 +19,9 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Runs the Psiphon tunnel core (libpsiphon.so, built from psiphon-tunnel-core in CI) as one process
- * and waits until it serves SOCKS5 on loopback and the tunnel is up. Notices arrive as JSON lines on
- * its stdout. The config follows UC-MAX's PsiphonCoreManager; the protocol choice follows its
- * TunnelManager (Conduit limits the protocols, the other three choices use CDN fronting).
+ * and waits until it serves SOCKS5 on loopback and the tunnel is up. The core writes notices as JSON
+ * lines (stderr is merged into stdout). Errors and unreadable lines are logged, so a failed start
+ * says why. The protocol choice follows UC-MAX's TunnelManager; Beast Mode sets AggressiveEstablishment.
  */
 object PsiphonSidecar {
     private const val TAG = "PSIPHON"
@@ -45,8 +45,35 @@ object PsiphonSidecar {
         "INPROXY-WEBRTC-SHADOWSOCKS-OSSH",
     )
 
+    private val CDN_PROTOCOLS = listOf(
+        "FRONTED-MEEK-CDN-OSSH",
+        "FRONTED-MEEK-CDN-HTTP-OSSH",
+        "FRONTED-MEEK-CDN-QUIC-OSSH",
+    )
+
+    private val DIRECT_PROTOCOLS = listOf(
+        "SSH",
+        "OSSH",
+        "TLS-OSSH",
+        "UNFRONTED-MEEK-OSSH",
+        "UNFRONTED-MEEK-HTTPS-OSSH",
+        "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
+        "QUIC-OSSH",
+        "SHADOWSOCKS-OSSH",
+        "FRONTED-MEEK-OSSH",
+        "FRONTED-MEEK-CDN-OSSH",
+        "FRONTED-MEEK-HTTP-OSSH",
+        "FRONTED-MEEK-CDN-HTTP-OSSH",
+        "FRONTED-MEEK-QUIC-OSSH",
+        "FRONTED-MEEK-CDN-QUIC-OSSH",
+    )
+
     @Volatile
     private var process: Process? = null
+
+    /** The last error the core reported for the current start, shown when the start fails. */
+    @Volatile
+    private var lastProblem = ""
 
     /**
      * Starts the tunnel for [region] ("" = auto) and returns once it is connected.
@@ -54,6 +81,7 @@ object PsiphonSidecar {
      */
     suspend fun connect(context: Context, region: String) {
         stop()
+        lastProblem = ""
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY)
         if (!binary.exists()) throw IllegalStateException("The Psiphon core is not packaged in this build")
         val dir = File(context.filesDir, "psiphon").apply { mkdirs() }
@@ -121,17 +149,31 @@ object PsiphonSidecar {
             }
         } catch (_: IOException) {
         } finally {
-            val gone = IllegalStateException("Psiphon exited")
+            val code = runCatching { p.waitFor() }.getOrDefault(-1)
+            val reason = lastProblem.ifEmpty { "exit code $code" }
+            if (process === p) VpnLogBus.warning(TAG, "the core exited: $reason")
+            val gone = IllegalStateException("Psiphon exited: $reason")
             portReady.completeExceptionally(gone)
             tunnelUp.completeExceptionally(gone)
-            if (process === p) VpnLogBus.warning(TAG, "the core process exited")
         }
     }
 
     private fun dispatch(line: String, portReady: CompletableDeferred<Unit>, tunnelUp: CompletableDeferred<Unit>) {
-        val notice = runCatching { JSONObject(line) }.getOrNull() ?: return
+        val notice = runCatching { JSONObject(line) }.getOrNull()
+        if (notice == null) {
+            if (line.isNotBlank()) {
+                lastProblem = line.take(300)
+                VpnLogBus.info(TAG, line.take(300))
+            }
+            return
+        }
         val data = notice.optJSONObject("data") ?: JSONObject()
         when (notice.optString("noticeType")) {
+            "Error" -> {
+                val message = data.optString("message").ifEmpty { line.take(300) }
+                lastProblem = message.take(300)
+                VpnLogBus.warning(TAG, message.take(300))
+            }
             "ListeningSocksProxyPort" -> {
                 if (data.optInt("port") == PsiphonLinks.SOCKS_PORT) {
                     portReady.complete(Unit)
@@ -161,16 +203,29 @@ object PsiphonSidecar {
             .put("RemoteServerListDownloadFilename", File(dir, "psiphon_remote_server_list").absolutePath)
             .put("RemoteServerListUrls", remoteServerListUrls())
             .put("RemoteServerListSignaturePublicKey", SIGNATURE_PUBLIC_KEY)
-        if (PsiphonPrefs.protocolMode(context) == PsiphonPrefs.MODE_CONDUIT) {
-            json.put("LimitTunnelProtocols", JSONArray(CONDUIT_PROTOCOLS))
-        } else {
-            val overrides = cdnFrontingOverrides(context)
-            if (overrides.length() > 0) {
-                json.put("FrontedMeekDialOverrides", overrides)
-                json.put("FrontedMeekDialOverridesProbability", 1.0)
+        // The same four choices as TunnelManager: Conduit, CDN fronting, direct, and auto.
+        when (PsiphonPrefs.protocolMode(context)) {
+            PsiphonPrefs.MODE_CONDUIT -> json.put("LimitTunnelProtocols", JSONArray(CONDUIT_PROTOCOLS))
+            PsiphonPrefs.MODE_CDN_FRONTING -> {
+                json.put("LimitTunnelProtocols", JSONArray(CDN_PROTOCOLS)).put("DisableTactics", true)
+                putCdnFronting(json, context)
             }
+            PsiphonPrefs.MODE_DIRECT -> {
+                json.put("LimitTunnelProtocols", JSONArray(DIRECT_PROTOCOLS)).put("DisableTactics", true)
+                putCdnFronting(json, context)
+            }
+            else -> putCdnFronting(json, context)
         }
+        if (PsiphonPrefs.beastMode(context)) json.put("AggressiveEstablishment", true)
         return json.toString()
+    }
+
+    private fun putCdnFronting(json: JSONObject, context: Context) {
+        val overrides = cdnFrontingOverrides(context)
+        if (overrides.length() > 0) {
+            json.put("FrontedMeekDialOverrides", overrides)
+            json.put("FrontedMeekDialOverridesProbability", 1.0)
+        }
     }
 
     /** One dial override per healthy edge IP. The first typed SNI hostname is used, else the scanner's probe name. */

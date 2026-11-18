@@ -103,6 +103,27 @@ object PsiphonServerList {
         false
     }
 
+    /**
+     * Server endpoints (ip, web port) of one egress region, "" for all regions. Uses the cached
+     * list when there is one, so pinging does not wait for a download.
+     */
+    fun endpoints(context: Context, region: String): List<Pair<String, Int>> {
+        val entries = loadCache(context) ?: resolve(context)
+        return entries.mapNotNull { parseEndpoint(it) }
+            .filter { region.isEmpty() || it.third.equals(region, ignoreCase = true) }
+            .map { it.first to it.second }
+    }
+
+    /** Decodes one hex entry to (ip, web port, region). Null when the entry is not usable. */
+    private fun parseEndpoint(hex: String): Triple<String, Int, String>? = try {
+        val text = String(hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray(), Charsets.UTF_8)
+        val json = JSONObject(text.substring(text.indexOf('{'), text.lastIndexOf('}') + 1))
+        val port = json.optString("webServerPort").toIntOrNull() ?: 0
+        if (port in 1..65535) Triple(json.getString("ipAddress"), port, json.optString("region")) else null
+    } catch (e: Exception) {
+        null
+    }
+
     private fun saveCache(context: Context, entries: List<String>) {
         try {
             val target = File(context.filesDir, CACHE_FILE)

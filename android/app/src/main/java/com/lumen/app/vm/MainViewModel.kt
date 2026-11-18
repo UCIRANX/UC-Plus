@@ -3087,9 +3087,20 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * selector/urltest members before probing; do the same here and keep the
      * best reachable member as the AUTO latency.
      */
+    private suspend fun psiphonRegionPing(entity: NodeEntity): Int {
+        val region = com.lumen.core.config.psiphon.PsiphonLinks.regionOf(entity.link) ?: return 0
+        val endpoints = withContext(Dispatchers.IO) {
+            com.lumen.core.vpn.psiphon.PsiphonServerList.endpoints(getApplication<Application>(), region)
+        }.shuffled().take(4)
+        if (endpoints.isEmpty()) return 0
+        return kotlinx.coroutines.coroutineScope {
+            endpoints.map { (ip, port) -> async { tcpPing(ip, port) } }.awaitAll()
+        }.filter { it > 0 }.minOrNull() ?: 0
+    }
+
     private suspend fun measureNodePing(entity: NodeEntity): Int {
-        // Psiphon has no server of its own to probe: its tunnel exists only while connected.
-        if (entity.protocol.equals("psiphon", ignoreCase = true)) return 0
+        // Psiphon: the fastest TCP answer of a few servers in the node's region.
+        if (entity.protocol.equals("psiphon", ignoreCase = true)) return psiphonRegionPing(entity)
         // The SOCKS detour only exists while the SSTP bridge runs, so probe the server directly.
         if (entity.protocol.equals("sstp", ignoreCase = true) || entity.protocol.equals("tor", ignoreCase = true)) {
             return tcpPing(entity.server, entity.port)

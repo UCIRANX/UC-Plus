@@ -32,7 +32,7 @@ object PsiphonPrefs {
 
     /** Beast Mode: try every protocol on every server. Shown in the scan section of the popup. */
     fun beastMode(context: Context): Boolean =
-        runCatching { prefs(context).getBoolean(KEY_BEAST, false) }.getOrDefault(false)
+        runCatching { prefs(context).getBoolean(KEY_BEAST, true) }.getOrDefault(true)
 
     fun setBeastMode(context: Context, on: Boolean) {
         runCatching { prefs(context).edit().putBoolean(KEY_BEAST, on).apply() }
