@@ -1616,7 +1616,6 @@ fun LumenApp(
                     // config from another section makes the old Tor highlight disappear.
                     val torSelectedActive = nodes.any { it.isSelected && it.protocol.equals("tor", ignoreCase = true) }
                     val torHighlight: String? = if (torSelectedActive && !torPicked) torCountry else null
-                    }
                     val torServersByCountry by viewModel.torServersByCountry.collectAsStateWithLifecycle()
                     val disabledProtocols by viewModel.disabledProtocols.collectAsStateWithLifecycle()
                     var torExpandedCode by rememberSaveable { mutableStateOf("") }
@@ -1638,6 +1637,7 @@ fun LumenApp(
                             TorCountryRow(code, TorCountries.name(code, torLocale), count,
                                 code in torFavoriteCountries, best)
                         }
+                    }
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
                         torControls = { protocol ->
