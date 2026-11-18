@@ -6,6 +6,11 @@ import com.lumen.core.config.psiphon.PsiphonLinks
 import com.lumen.core.vpn.VpnLogBus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentLinkedQueue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -68,6 +73,19 @@ object PsiphonSidecar {
         "FRONTED-MEEK-CDN-QUIC-OSSH",
     )
 
+    /** Spare loopback ports for test tunnels; two probes run at a time, each on its own port. */
+    private val probePorts = ConcurrentLinkedQueue(listOf(10860, 10861))
+    private val probeGate = Semaphore(2)
+    private const val PROBE_TIMEOUT_MS = 45_000L
+    private const val LIST_REUSE_MS = 10 * 60_000L
+    private val listLock = Mutex()
+
+    @Volatile
+    private var preparedList: File? = null
+
+    @Volatile
+    private var preparedAt = 0L
+
     @Volatile
     private var process: Process? = null
 
@@ -85,20 +103,15 @@ object PsiphonSidecar {
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY)
         if (!binary.exists()) throw IllegalStateException("The Psiphon core is not packaged in this build")
         val dir = File(context.filesDir, "psiphon").apply { mkdirs() }
-        val entries = withContext(Dispatchers.IO) { PsiphonServerList.resolve(context) }
-        if (entries.isEmpty()) throw IllegalStateException("No Psiphon server entries could be downloaded")
+        val entryFile = serverListFile(context)
         val configFile = File(dir, "psiphon.config")
-        val listFile = File(dir, "psiphon_server_entries.txt")
-        withContext(Dispatchers.IO) {
-            configFile.writeText(buildConfig(context, dir, region))
-            listFile.writeText(entries.joinToString("\n"))
-        }
+        withContext(Dispatchers.IO) { configFile.writeText(buildConfig(context, dir, region)) }
         val portReady = CompletableDeferred<Unit>()
         val tunnelUp = CompletableDeferred<Unit>()
         val started = try {
             ProcessBuilder(
                 binary.absolutePath, "-config", configFile.absolutePath,
-                "-dataRootDirectory", dir.absolutePath, "-serverList", listFile.absolutePath,
+                "-dataRootDirectory", dir.absolutePath, "-serverList", entryFile.absolutePath,
             ).directory(dir).redirectErrorStream(true).start()
         } catch (e: IOException) {
             throw IllegalStateException("Psiphon could not start: ${e.message}")
@@ -126,6 +139,103 @@ object PsiphonSidecar {
             throw IllegalStateException(e.message ?: "Psiphon failed")
         }
         VpnLogBus.info(TAG, "tunnel is up on 127.0.0.1:${PsiphonLinks.SOCKS_PORT}")
+    }
+
+    /**
+     * The server entries as one file. Downloaded once and reused for [LIST_REUSE_MS], so a ping batch
+     * and a connect do not each download the list again.
+     */
+    private suspend fun serverListFile(context: Context): File = listLock.withLock {
+        val known = preparedList
+        if (known != null && known.exists() && System.currentTimeMillis() - preparedAt < LIST_REUSE_MS) {
+            return@withLock known
+        }
+        val entries = withContext(Dispatchers.IO) { PsiphonServerList.resolve(context) }
+        if (entries.isEmpty()) throw IllegalStateException("No Psiphon server entries could be downloaded")
+        val file = File(File(context.filesDir, "psiphon").apply { mkdirs() }, "psiphon_server_entries.txt")
+        withContext(Dispatchers.IO) { file.writeText(entries.joinToString("\n")) }
+        preparedList = file
+        preparedAt = System.currentTimeMillis()
+        file
+    }
+
+    /**
+     * A brief test tunnel for [region] ("" = auto): its own core on a spare port, timed until the tunnel
+     * is up, then stopped. Returns the milliseconds, or -1 when no tunnel came up. The running tunnel is not touched.
+     */
+    suspend fun probeRegion(context: Context, region: String): Int {
+        val binary = File(context.applicationInfo.nativeLibraryDir, BINARY)
+        if (!binary.exists()) return -1
+        val entryFile = try {
+            serverListFile(context)
+        } catch (e: IllegalStateException) {
+            VpnLogBus.warning(TAG, e.message ?: "no server entries")
+            return -1
+        }
+        return probeGate.withPermit {
+            val port = probePorts.poll() ?: return@withPermit -1
+            try {
+                runProbe(context, binary, entryFile, region, port)
+            } finally {
+                probePorts.add(port)
+            }
+        }
+    }
+
+    private suspend fun runProbe(context: Context, binary: File, entryFile: File, region: String, port: Int): Int {
+        val dir = File(context.filesDir, "psiphon/probe-$port").apply { mkdirs() }
+        val configFile = File(dir, "psiphon.config")
+        withContext(Dispatchers.IO) { configFile.writeText(buildConfig(context, dir, region, port, probe = true)) }
+        val started = try {
+            ProcessBuilder(
+                binary.absolutePath, "-config", configFile.absolutePath,
+                "-dataRootDirectory", dir.absolutePath, "-serverList", entryFile.absolutePath,
+            ).directory(dir).redirectErrorStream(true).start()
+        } catch (e: IOException) {
+            return -1
+        }
+        val tunnelUp = CompletableDeferred<Unit>()
+        val began = System.nanoTime()
+        Thread({
+            try {
+                BufferedReader(InputStreamReader(started.inputStream, Charsets.UTF_8)).use { reader ->
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (isTunnelUpNotice(line)) tunnelUp.complete(Unit)
+                    }
+                }
+            } catch (_: IOException) {
+            } finally {
+                tunnelUp.completeExceptionally(IOException("the probe core stopped"))
+            }
+        }, "psiphon-probe-$port").apply {
+            isDaemon = true
+            start()
+        }
+        return try {
+            val up = withTimeoutOrNull(PROBE_TIMEOUT_MS) {
+                tunnelUp.await()
+                true
+            }
+            if (up == true) ((System.nanoTime() - began) / 1_000_000).toInt() else -1
+        } catch (e: IOException) {
+            -1
+        } finally {
+            runCatching {
+                started.destroy()
+                started.waitFor(3, TimeUnit.SECONDS)
+                if (started.isAlive) started.destroyForcibly()
+            }
+        }
+    }
+
+    private fun isTunnelUpNotice(line: String): Boolean {
+        val notice = runCatching { JSONObject(line) }.getOrNull() ?: return false
+        return when (notice.optString("noticeType")) {
+            "ActiveTunnel" -> true
+            "Tunnels" -> (notice.optJSONObject("data") ?: JSONObject()).optInt("count") > 0
+            else -> false
+        }
     }
 
     /** Stops the core process. Safe to call when nothing runs. */
@@ -191,17 +301,21 @@ object PsiphonSidecar {
         }
     }
 
-    private fun buildConfig(context: Context, dir: File, region: String): String {
+    private fun buildConfig(
+        context: Context, dir: File, region: String,
+        port: Int = PsiphonLinks.SOCKS_PORT, probe: Boolean = false,
+    ): String {
         val json = JSONObject()
             .put("PropagationChannelId", PROPAGATION_CHANNEL_ID)
             .put("SponsorId", SPONSOR_ID)
-            .put("LocalSocksProxyPort", PsiphonLinks.SOCKS_PORT)
+            .put("LocalSocksProxyPort", port)
             .put("LocalHttpProxyPort", 0)
             .put("EgressRegion", region)
             .put("EmitDiagnosticNotices", true)
             .put("DataRootDirectory", dir.absolutePath)
             .put("RemoteServerListDownloadFilename", File(dir, "psiphon_remote_server_list").absolutePath)
-            .put("RemoteServerListUrls", remoteServerListUrls())
+            // A probe uses the entries it is given and never downloads a list itself.
+            .put("RemoteServerListUrls", if (probe) JSONArray() else remoteServerListUrls())
             .put("RemoteServerListSignaturePublicKey", SIGNATURE_PUBLIC_KEY)
         // The same four choices as TunnelManager: Conduit, CDN fronting, direct, and auto.
         when (PsiphonPrefs.protocolMode(context)) {
@@ -216,6 +330,7 @@ object PsiphonSidecar {
             }
             else -> putCdnFronting(json, context)
         }
+        if (probe) json.put("DisableTactics", true)
         if (PsiphonPrefs.beastMode(context)) json.put("AggressiveEstablishment", true)
         return json.toString()
     }

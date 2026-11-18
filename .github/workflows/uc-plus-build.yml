@@ -130,7 +130,7 @@ jobs:
         with:
           path: |
             android/app/src/main/jniLibs/*/*.so
-          key: native-${{ hashFiles('android/tools/build_native_libs.sh', 'android/patches/**', 'android/app/singbox-core.json', 'android/native/**') }}
+          key: native-go122-${{ hashFiles('android/tools/build_native_libs.sh', 'android/patches/**', 'android/app/singbox-core.json', 'android/native/**') }}
 
       - name: Build the native engines
         env:

@@ -2,7 +2,7 @@
 """Downloads Psiphon's official server list and writes two files for the app:
 
   server_list_compressed  the list exactly as Psiphon publishes it (zlib-compressed JSON)
-  psiphon.txt             one "psiphon://auto#Psiphon" line and one "psiphon://<CC>#<CC>" line per
+  psiphon.txt             one "psiphon://auto#Psiphon Auto" line and one "psiphon://<CC>#<CC>" line per
                           egress region found in the list
 
 The list is only written when it can be read and holds at least one region. Otherwise nothing is
@@ -61,7 +61,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "server_list_compressed"), "wb") as handle:
         handle.write(blob)
-    lines = ["psiphon://auto#Psiphon"] + [f"psiphon://{code}#{code}" for code in sorted(regions)]
+    lines = ["psiphon://auto#Psiphon Auto"] + [f"psiphon://{code}#{code}" for code in sorted(regions)]
     with open(os.path.join(args.out, "psiphon.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
     print(f"Psiphon: {len(regions)} regions written")
