@@ -360,7 +360,7 @@ fun ServerListScreen(
             }
 
             ServerFilterBar(
-                protocol, (prepared.protocols + listOfNotNull("tor".takeIf { nodes.any { protocolKey(it) == "tor" } }))
+                protocol, (prepared.protocols + listOfNotNull("tor".takeIf { nodes.any { protocolKey(it) == "tor" } }) + "psiphon")
                     .distinct().sortedWith(compareBy<String> { protocolRank(it) }.thenBy { it }), { protocol = it },
                 groupByCountry, { countryPref = if (it) "1" else "0" },
                 onlyReachable, { reachablePref = if (it) "1" else "0" }, maxPing, { maxPingPref = it.toString() },

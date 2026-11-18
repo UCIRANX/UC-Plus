@@ -5,12 +5,14 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -46,6 +48,7 @@ fun PsiphonScanDialog(onDismiss: () -> Unit) {
     var sni by remember { mutableStateOf(PsiphonPrefs.cdnSni(context)) }
     var rangesText by remember { mutableStateOf(CdnIpScanner.DEFAULT_AKAMAI_RANGES.joinToString("\n")) }
     var manualText by remember { mutableStateOf("") }
+    var beast by remember { mutableStateOf(PsiphonPrefs.beastMode(context)) }
     // Healthy IPs found by the scanner are saved in the same list; show them while the scan runs.
     LaunchedEffect(scan.healthy) { edgeIps = CdnEdgeIpPreferences.load(context) }
 
@@ -112,6 +115,19 @@ fun PsiphonScanDialog(onDismiss: () -> Unit) {
                     minLines = 2,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(t.beastMode, fontWeight = FontWeight.Bold)
+                        Text(t.beastModeDesc)
+                    }
+                    Switch(
+                        checked = beast,
+                        onCheckedChange = {
+                            beast = it
+                            PsiphonPrefs.setBeastMode(context, it)
+                        },
+                    )
+                }
                 Text(t.progress(scan.scanned, scan.healthy))
                 Row {
                     TextButton(onClick = { CdnIpScanner.start(context, rangesText, manualText, manualMode = false) }) {
