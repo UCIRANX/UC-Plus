@@ -19,8 +19,9 @@ import java.util.zip.InflaterInputStream
  */
 object PsiphonServerList {
 
+    /** The copy this repository publishes (psiphon branch), refreshed by the uc-plus-psiphon workflow. */
     const val MIRROR_URL =
-        "https://raw.githubusercontent.com/UCIRANX/UC-MAX/main/psiphon-mirror/server_list_compressed"
+        "https://raw.githubusercontent.com/UCIRANX/UC-Plus/psiphon/server_list_compressed"
     const val ORIGINAL_URL =
         "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed"
 

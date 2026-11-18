@@ -10,8 +10,8 @@ object PsiphonLinks {
     const val SOCKS_PORT = 10850
     const val AUTO = "auto"
 
-    /** Published by the bridges workflow next to tor.txt (tools/collect_psiphon.py). */
-    const val SUBSCRIPTION_URL = "https://raw.githubusercontent.com/UCIRANX/UC-Plus/bridges/psiphon.txt"
+    /** Published by the uc-plus-psiphon workflow on the psiphon branch (tools/collect_psiphon.py). */
+    const val SUBSCRIPTION_URL = "https://raw.githubusercontent.com/UCIRANX/UC-Plus/psiphon/psiphon.txt"
 
     /** Egress region of a node link: "" for auto, an upper-case code, or null when the link is invalid. */
     fun regionOf(link: String): String? {

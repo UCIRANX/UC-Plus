@@ -73,6 +73,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # The Psiphon core must be built with Go 1.22: its psiphon-tls fork checks the layout of
+      # crypto/tls against that release and panics at start with any newer toolchain.
+      - name: Set up Go 1.22 for the Psiphon core
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Remember the Go 1.22 path
+        run: echo "PSIPHON_GO=$(go env GOROOT)/bin/go" >> "$GITHUB_ENV"
+
       - name: Set up Go for the native engines
         uses: actions/setup-go@v5
         with:

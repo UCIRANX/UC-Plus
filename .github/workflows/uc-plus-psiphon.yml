@@ -1,0 +1,54 @@
+name: UC Plus Psiphon servers
+
+# Downloads Psiphon's official server list (Amazon S3), writes psiphon.txt (one psiphon:// line per
+# egress region) and publishes both files to the "psiphon" branch. The app reads that branch first and
+# the S3 address second. Runs every 6 hours at minute 47, apart from the Tor bridges workflow (minute 17).
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: uc-plus-psiphon
+  cancel-in-progress: false
+
+jobs:
+  psiphon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools
+          fetch-depth: 1
+
+      - name: Download the official Psiphon server list
+        run: |
+          set -euo pipefail
+          python3 tools/collect_psiphon.py --out "$RUNNER_TEMP/psiphon-out"
+          ls -la "$RUNNER_TEMP/psiphon-out" || true
+
+      - name: Publish to the "psiphon" branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/psiphon-out"
+          if [ ! -s "$out/psiphon.txt" ] || [ ! -s "$out/server_list_compressed" ]; then
+            echo "::warning::No Psiphon list was downloaded, so the psiphon branch was not changed."
+            exit 0
+          fi
+          cd "$out"
+          git init -q
+          git checkout -q -b psiphon
+          git add -A
+          git -c user.name="uc-plus-psiphon" -c user.email="uc-plus-psiphon@users.noreply.github.com" \
+            commit -q -m "Update Psiphon servers $(date -u +%FT%TZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" psiphon
+          echo "Published to the psiphon branch."

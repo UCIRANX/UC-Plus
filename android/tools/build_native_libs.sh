@@ -132,7 +132,7 @@ if [ "$need_psiphon" = 1 ]; then
     mkdir -p "$JNI/$abi"
     ( cd "$src" && \
       CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
-      go build -trimpath -tags PSIPHON_ENABLE_INPROXY -ldflags "-s -w" -o "$JNI/$abi/libpsiphon.so" ./ConsoleClient )
+      "${PSIPHON_GO:-go}" build -trimpath -tags PSIPHON_ENABLE_INPROXY -ldflags "-s -w" -o "$JNI/$abi/libpsiphon.so" ./ConsoleClient )
     echo "built libpsiphon.so for $abi"
   done
 fi

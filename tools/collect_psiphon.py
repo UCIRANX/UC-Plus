@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Writes psiphon.txt for the Psiphon subscription: "psiphon://auto#Psiphon" and one
-"psiphon://<CC>#<CC>" line per egress region found in the Psiphon server list.
+"""Downloads Psiphon's official server list and writes two files for the app:
 
-The list is read the way the app reads it: the GitHub mirror first, then Psiphon's own S3 copy.
-The file is zlib-compressed JSON whose "data" field holds one hex-encoded server entry per line;
-each decoded entry is a JSON object with a "region" field. When neither source can be read,
-nothing is written and the script still exits 0, so the publish step keeps the last good file.
+  server_list_compressed  the list exactly as Psiphon publishes it (zlib-compressed JSON)
+  psiphon.txt             one "psiphon://auto#Psiphon" line and one "psiphon://<CC>#<CC>" line per
+                          egress region found in the list
+
+The list is only written when it can be read and holds at least one region. Otherwise nothing is
+written, so the publish step keeps the last good files.
 """
 import argparse
 import json
@@ -14,7 +15,6 @@ import sys
 import urllib.request
 import zlib
 
-MIRROR_URL = "https://raw.githubusercontent.com/UCIRANX/UC-MAX/main/psiphon-mirror/server_list_compressed"
 ORIGINAL_URL = "https://s3.amazonaws.com//psiphon/web/mjr4-p23r-puwl/server_list_compressed"
 
 
@@ -25,6 +25,7 @@ def download(url):
 
 
 def entry_regions(blob):
+    """Regions of the entries in a server list. Raises ValueError when the list cannot be read."""
     data = json.loads(zlib.decompress(blob).decode("utf-8"))["data"]
     regions = set()
     for line in data.split("\n"):
@@ -48,23 +49,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    regions = set()
-    for name, url in (("mirror", MIRROR_URL), ("s3", ORIGINAL_URL)):
-        try:
-            regions = entry_regions(download(url))
-        except Exception as error:  # network, zlib or JSON problems: try the next source
-            print(f"::warning::Psiphon {name} list unavailable: {error}", file=sys.stderr)
-            continue
-        if regions:
-            print(f"Psiphon regions from {name}: {len(regions)}")
-            break
+    try:
+        blob = download(ORIGINAL_URL)
+        regions = entry_regions(blob)
+    except Exception as error:  # network, zlib or JSON problems: keep the last good files
+        print(f"::warning::Psiphon official list unavailable: {error}", file=sys.stderr)
+        return 0
     if not regions:
-        print("::warning::No Psiphon regions found; psiphon.txt was not written")
+        print("::warning::The Psiphon list has no regions; nothing was written")
         return 0
     os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, "server_list_compressed"), "wb") as handle:
+        handle.write(blob)
     lines = ["psiphon://auto#Psiphon"] + [f"psiphon://{code}#{code}" for code in sorted(regions)]
     with open(os.path.join(args.out, "psiphon.txt"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
+    print(f"Psiphon: {len(regions)} regions written")
     return 0
 
 

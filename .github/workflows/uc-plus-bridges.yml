@@ -45,12 +45,6 @@ jobs:
           python3 tools/classify_bridges.py --out "$out"
           echo "Labelled bridges: $(grep -c . "$out/tor-countries.txt" || true)"
 
-      - name: Collect Psiphon regions
-        run: |
-          set -euo pipefail
-          python3 tools/collect_psiphon.py --out "$RUNNER_TEMP/bridges-out"
-          echo "Psiphon regions in psiphon.txt: $(grep -c . "$RUNNER_TEMP/bridges-out/psiphon.txt" 2>/dev/null || echo 0)"
-
       - name: Publish tor.txt and bridges.json to the "bridges" branch
         env:
           GH_TOKEN: ${{ github.token }}
