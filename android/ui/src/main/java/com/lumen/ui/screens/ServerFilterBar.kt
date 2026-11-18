@@ -56,7 +56,12 @@ internal fun ServerFilterBar(
             LumenMenu(protocolMenu, { protocolMenu = false }) {
                 Text(s.protocolHint, Modifier.padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 2.dp),
                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                DropdownMenuItem(text = { Text(s.allProtocols) },
+                DropdownMenuItem(text = {
+                    Text(s.allProtocols,
+                        Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                        fontWeight = FontWeight.Bold)
+                },
                     trailingIcon = { if (protocol.isEmpty()) Icon(Icons.Default.Check, null) },
                     onClick = { onProtocol(""); protocolMenu = false })
                 protocols.forEach { id ->

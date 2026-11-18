@@ -1631,18 +1631,17 @@ fun LumenApp(
                     // Rows for the server list, recomputed only when the Tor data changes so the list does
                     // not re-sort on unrelated recompositions.
                     val torRows = remember(torCountryCounts, torServersByCountry, torFavoriteCountries, torLocale) {
-                        // Tor Auto: one row for every Tor server, placed by its best ping like the countries.
-                        val everyServer = torServersByCountry.values.flatten()
-                        val autoRow = TorCountryRow("", "Tor Auto", torCountryCounts.values.sum(),
-                            "" in torFavoriteCountries,
-                            everyServer.mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }.minOrNull())
-                        listOf(autoRow) + torCountryCounts.map { (code, count) ->
+                        val countryRows = torCountryCounts.map { (code, count) ->
                             val best = torServersByCountry[code].orEmpty()
                                 .mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }
                                 .minOrNull()
                             TorCountryRow(code, TorCountries.name(code, torLocale), count,
                                 code in torFavoriteCountries, best)
                         }
+                        // Tor Auto: its ping is the best ping of the countries, placed among them the same way.
+                        val autoRow = TorCountryRow("", "Tor Auto", torCountryCounts.values.sum(),
+                            "" in torFavoriteCountries, countryRows.mapNotNull { it.pingMs }.minOrNull())
+                        listOf(autoRow) + countryRows
                     }
                     LaunchedEffect(Unit) { viewModel.logStartup("server screen composed") }
                     val psiphonScanOpen by viewModel.psiphonScanOpen.collectAsStateWithLifecycle()
@@ -1663,7 +1662,7 @@ fun LumenApp(
                         torRows = torRows,
                         torSelectedCountry = torHighlight,
                         torExpandedCode = torExpandedCode,
-                        torServersOf = { code -> if (code.isEmpty()) torServersByCountry.values.flatten() else torServersByCountry[code].orEmpty() },
+                        torServersOf = { code -> if (code.isEmpty()) emptyList() else torServersByCountry[code].orEmpty() },
                         torAnyLabel = "Tor Auto",
                         onTorSelectCountry = { code ->
                             viewModel.selectTorCountry(code)

@@ -608,7 +608,8 @@ fun ServerListScreen(
                                 showPing = true,
                                 selected = info.selected,
                                 favorite = node.isFavorite,
-                                expanded = info.expanded,
+                                // Tor Auto has no servers of its own, so it has no arrow.
+                                expanded = if (node.countryCode.isEmpty()) null else info.expanded,
                                 onClick = { onTorSelectCountry(node.countryCode) },
                                 onToggleExpand = { onTorToggleExpand(node.countryCode) },
                                 onFavorite = { onTorFavorite(node.countryCode) },
@@ -894,7 +895,7 @@ private fun torCountryNode(row: TorCountryRow, selected: String?, expandedCode: 
     torCountry = TorCountryInfo(
         count = row.count,
         selected = selected.equals(row.code, ignoreCase = true),
-        expanded = expandedCode.equals(row.code, ignoreCase = true),
+        expanded = row.code.isNotEmpty() && expandedCode.equals(row.code, ignoreCase = true),
     ),
 )
 

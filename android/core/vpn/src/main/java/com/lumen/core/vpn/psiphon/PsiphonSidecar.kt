@@ -74,9 +74,9 @@ object PsiphonSidecar {
     )
 
     /** Spare loopback ports for test tunnels; two probes run at a time, each on its own port. */
-    private val probePorts = ConcurrentLinkedQueue(listOf(10860, 10861))
-    private val probeGate = Semaphore(2)
-    private const val PROBE_TIMEOUT_MS = 45_000L
+    private val probePorts = ConcurrentLinkedQueue((10860..10865).toList())
+    private val probeGate = Semaphore(6)
+    private const val PROBE_TIMEOUT_MS = 25_000L
     private const val LIST_REUSE_MS = 10 * 60_000L
     private val listLock = Mutex()
 
@@ -240,7 +240,7 @@ object PsiphonSidecar {
 
     /** The text worth logging from a core line: a non-JSON line, or an Error notice's message. */
     private fun probeProblem(line: String): String? {
-        if (line.isBlank()) return null
+        if (line.isBlank() || line.contains("networkid.Get failed")) return null
         val notice = runCatching { JSONObject(line) }.getOrNull() ?: return line.take(300)
         if (notice.optString("noticeType") != "Error") return null
         return (notice.optJSONObject("data") ?: JSONObject()).optString("message").take(300).takeIf { it.isNotEmpty() }
