@@ -286,6 +286,7 @@ fun ServerListScreen(
         BrandTopBar(
             title = "UC Plus",
             subtitle = "Telegram: @UCIRANIR",
+            glowSubtitle = true,
             onClick = { uriHandler.openUri("https://t.me/uciranir") },
             actions = {
                 Column(horizontalAlignment = Alignment.End) {

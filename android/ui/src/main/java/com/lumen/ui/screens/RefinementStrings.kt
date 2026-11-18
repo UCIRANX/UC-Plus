@@ -11,3 +11,6 @@ val LumenStrings.serverLayoutList get() = refined("List", "Список", "فه�
 val LumenStrings.serverLayoutGrid get() = refined("Compact grid", "Компактная сетка", "شبکهٔ فشرده", "紧凑网格")
 val LumenStrings.cryptoSupport get() = refined("Cryptocurrency", "Криптовалюта", "رمزارز", "加密货币")
 val LumenStrings.walletAddress get() = refined("Wallet address", "Адрес кошелька", "آدرس کیف پول", "钱包地址")
+
+/** One line above the protocol list: tapping a name opens that section. */
+val LumenStrings.protocolHint get() = refined("Tap a name to open its section", "Нажмите на название, чтобы открыть раздел", "روی اسم بزن تا بخش آن باز شود", "点击名称即可打开该分组")

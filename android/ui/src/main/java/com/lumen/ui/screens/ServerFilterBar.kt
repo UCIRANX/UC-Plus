@@ -6,6 +6,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -48,6 +49,8 @@ internal fun ServerFilterBar(
                 Icon(Icons.Default.KeyboardArrowDown, null, Modifier.size(16.dp))
             }
             LumenMenu(protocolMenu, { protocolMenu = false }) {
+                Text(s.protocolHint, Modifier.padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 2.dp),
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 DropdownMenuItem(text = { Text(s.allProtocols) },
                     trailingIcon = { if (protocol.isEmpty()) Icon(Icons.Default.Check, null) },
                     onClick = { onProtocol(""); protocolMenu = false })
@@ -59,6 +62,8 @@ internal fun ServerFilterBar(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(label, Modifier.weight(1f),
                                     fontWeight = if (protocol == id) FontWeight.Bold else FontWeight.Normal)
+                                Icon(Icons.Default.KeyboardArrowRight, null, Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Checkbox(checked = id !in disabledProtocols,
                                     onCheckedChange = { onProtocolEnabled(id, it) })
                             }
