@@ -1633,7 +1633,7 @@ fun LumenApp(
                     val torRows = remember(torCountryCounts, torServersByCountry, torFavoriteCountries, torLocale) {
                         // Tor Auto: one row for every Tor server, placed by its best ping like the countries.
                         val everyServer = torServersByCountry.values.flatten()
-                        val autoRow = TorCountryRow("", "Tor Auto", torCountryCounts.sumOf { (_, count) -> count },
+                        val autoRow = TorCountryRow("", "Tor Auto", torCountryCounts.values.sum(),
                             "" in torFavoriteCountries,
                             everyServer.mapNotNull { node -> node.pingMs?.takeIf { it > 0 } }.minOrNull())
                         listOf(autoRow) + torCountryCounts.map { (code, count) ->
