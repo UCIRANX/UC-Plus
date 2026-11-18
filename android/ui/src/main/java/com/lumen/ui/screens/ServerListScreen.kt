@@ -246,6 +246,8 @@ fun ServerListScreen(
         }
     }
     BackHandler(enabled = selectedIds.isNotEmpty()) { selectedIds = emptySet() }
+    // Back inside a protocol section goes to All Protocols first.
+    BackHandler(enabled = protocol.isNotEmpty() && selectedIds.isEmpty()) { protocol = "" }
 
     // Tor servers are listed by country. Each country is an entry that sorts with the other rows,
     // and its servers appear under it when its arrow is open.

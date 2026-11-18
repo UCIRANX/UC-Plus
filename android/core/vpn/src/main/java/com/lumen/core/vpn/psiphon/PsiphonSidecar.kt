@@ -74,9 +74,19 @@ object PsiphonSidecar {
     )
 
     /** Spare loopback ports for test tunnels; two probes run at a time, each on its own port. */
-    private val probePorts = ConcurrentLinkedQueue((10860..10865).toList())
-    private val probeGate = Semaphore(6)
-    private const val PROBE_TIMEOUT_MS = 25_000L
+    private val probePorts = ConcurrentLinkedQueue((10860..10869).toList())
+    private val probeGate = Semaphore(10)
+    private const val PROBE_TIMEOUT_MS = 15_000L
+
+    /** Region test results of this session (a failed test removes its region). */
+    private val regionResults = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val activeRegionProbes = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** The best region test time so far, or -1 when none is known. */
+    fun bestRegionPing(): Int = regionResults.values.minOrNull() ?: -1
+
+    /** How many region tests are still running. */
+    fun regionProbesRunning(): Int = activeRegionProbes.get()
     private const val LIST_REUSE_MS = 10 * 60_000L
     private val listLock = Mutex()
 
@@ -164,6 +174,16 @@ object PsiphonSidecar {
      * is up, then stopped. Returns the milliseconds, or -1 when no tunnel came up. The running tunnel is not touched.
      */
     suspend fun probeRegion(context: Context, region: String): Int {
+        if (region.isEmpty()) return probeNow(context, region)
+        activeRegionProbes.incrementAndGet()
+        return try {
+            probeNow(context, region)
+        } finally {
+            activeRegionProbes.decrementAndGet()
+        }
+    }
+
+    private suspend fun probeNow(context: Context, region: String): Int {
         val binary = File(context.applicationInfo.nativeLibraryDir, BINARY)
         if (!binary.exists()) return -1
         val entryFile = try {
@@ -175,7 +195,11 @@ object PsiphonSidecar {
         return probeGate.withPermit {
             val port = probePorts.poll() ?: return@withPermit -1
             try {
-                runProbe(context, binary, entryFile, region, port)
+                runProbe(context, binary, entryFile, region, port).also { ms ->
+                    if (region.isNotEmpty()) {
+                        if (ms > 0) regionResults[region] = ms else regionResults.remove(region)
+                    }
+                }
             } finally {
                 probePorts.add(port)
             }

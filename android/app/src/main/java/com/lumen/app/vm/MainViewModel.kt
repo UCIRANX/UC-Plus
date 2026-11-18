@@ -3100,7 +3100,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Psiphon: a brief test tunnel to the node's region, timed until it is up, then stopped. */
     private suspend fun psiphonRegionPing(entity: NodeEntity): Int {
         val region = com.lumen.core.config.psiphon.PsiphonLinks.regionOf(entity.link) ?: return 0
-        val ms = com.lumen.core.vpn.psiphon.PsiphonSidecar.probeRegion(getApplication<Application>(), region)
+        val sidecar = com.lumen.core.vpn.psiphon.PsiphonSidecar
+        val ms = if (region.isEmpty()) {
+            // Auto is the best of the countries: wait for the country tests that are running, then take the best.
+            kotlinx.coroutines.withTimeoutOrNull(60_000L) {
+                while (sidecar.regionProbesRunning() > 0) kotlinx.coroutines.delay(200L)
+            }
+            sidecar.bestRegionPing().takeIf { it > 0 } ?: sidecar.probeRegion(getApplication<Application>(), region)
+        } else {
+            sidecar.probeRegion(getApplication<Application>(), region)
+        }
         return if (ms > 0) ms else 0
     }
 
