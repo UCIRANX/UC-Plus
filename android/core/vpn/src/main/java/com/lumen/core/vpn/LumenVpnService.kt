@@ -579,6 +579,11 @@ ${hevAuthLines}misc:
                 }
             }
         }
+        // Psiphon nodes: the tunnel core must be connected before the core dials its SOCKS port.
+        runtime.optJSONObject("_lumen_psiphon")?.let { psiphon ->
+            runtime.remove("_lumen_psiphon")
+            com.lumen.core.vpn.psiphon.PsiphonSidecar.connect(applicationContext, psiphon.optString("region"))
+        }
         runtime.optJSONObject("_lumen_xray")?.let { sidecar ->
             // A persisted tile/widget config may hold ports used by another app now.
             val inbounds = sidecar.getJSONArray("inbounds")
@@ -1342,6 +1347,7 @@ ${hevAuthLines}misc:
         sstpSidecar?.stop()
         sstpSidecar = null
         com.lumen.core.vpn.tor.TorSidecar.stop(applicationContext)
+        com.lumen.core.vpn.psiphon.PsiphonSidecar.stop()
         if (closeInterface) {
             runCatching { vpnInterface?.close() }
             vpnInterface = null

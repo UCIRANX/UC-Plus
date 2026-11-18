@@ -3,6 +3,7 @@
 #   libsingbox.so          sing-box extended core, built from source with the Lumen patches
 #   libxray.so             Xray-core; arm64/x86_64 are the official verified releases, armeabi-v7a is built here
 #   libhev-socks5-tunnel.so  hev-socks5-tunnel, built from source
+#   libpsiphon.so          Psiphon tunnel core (psiphon-tunnel-core ConsoleClient), built from source, no NDK
 # Needs: git, go (1.27.x), python3, Android NDK (ANDROID_NDK_HOME or ANDROID_NDK_ROOT).
 # Files that already exist are kept, so a cache of jniLibs skips the rebuild.
 set -euo pipefail
@@ -114,8 +115,30 @@ if [ "$need_sstp" = 1 ]; then
   echo "built libsstpbridge.so"
 fi
 
+# ---------- Psiphon tunnel core (pure Go executable, no NDK needed) ----------
+# The same source and ref UC-MAX builds its libpsiphon.so from. Run as a process, like sing-box.
+PSIPHON_REF="shirokhorshid"
+need_psiphon=0
+for t in "${targets[@]}"; do read -r abi _ <<<"$t"; have "$abi" libpsiphon.so || need_psiphon=1; done
+if [ "$need_psiphon" = 1 ]; then
+  src="$WORK/psiphon-tunnel-core"
+  if [ ! -d "$src/.git" ]; then
+    rm -rf "$src"
+    git clone --depth 1 --branch "$PSIPHON_REF" https://github.com/shirokhorshid/psiphon-tunnel-core.git "$src"
+  fi
+  for t in "${targets[@]}"; do
+    read -r abi goarch goarm _ <<<"$t"; goarm="${goarm//\'/}"
+    have "$abi" libpsiphon.so && continue
+    mkdir -p "$JNI/$abi"
+    ( cd "$src" && \
+      CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" \
+      go build -trimpath -tags PSIPHON_ENABLE_INPROXY -ldflags "-s -w" -o "$JNI/$abi/libpsiphon.so" ./ConsoleClient )
+    echo "built libpsiphon.so for $abi"
+  done
+fi
+
 for abi in armeabi-v7a arm64-v8a x86_64; do
-  for lib in libsingbox.so libxray.so libhev-socks5-tunnel.so libsstpbridge.so; do
+  for lib in libsingbox.so libxray.so libhev-socks5-tunnel.so libsstpbridge.so libpsiphon.so; do
     have "$abi" "$lib" || { echo "missing $abi/$lib after build" >&2; exit 1; }
   done
 done

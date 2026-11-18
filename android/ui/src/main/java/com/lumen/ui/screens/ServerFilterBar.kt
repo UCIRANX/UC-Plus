@@ -8,6 +8,7 @@ import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -31,7 +32,9 @@ internal fun ServerFilterBar(
     trailing: @Composable () -> Unit = {},
     // Protocols the user unchecked: hidden from the all-protocols list and skipped by its ping.
     disabledProtocols: Set<String> = emptySet(),
-    onProtocolEnabled: (String, Boolean) -> Unit = { _, _ -> }
+    onProtocolEnabled: (String, Boolean) -> Unit = { _, _ -> },
+    // Opens the Psiphon scan popup; the button sits in the Psiphon row of the protocol menu.
+    onOpenPsiphonScan: (() -> Unit)? = null
 ) {
     val s = LocalStrings.current
     var protocolMenu by remember { mutableStateOf(false) }
@@ -64,6 +67,15 @@ internal fun ServerFilterBar(
                                     fontWeight = if (protocol == id) FontWeight.Bold else FontWeight.Normal)
                                 Icon(Icons.Default.KeyboardArrowRight, null, Modifier.size(18.dp),
                                     tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (id.equals("psiphon", ignoreCase = true) && onOpenPsiphonScan != null) {
+                                    val scanText = com.lumen.ui.screens.psiphonScanTexts(s.localeCode)
+                                    TextButton(onClick = { protocolMenu = false; onOpenPsiphonScan() },
+                                        contentPadding = PaddingValues(horizontal = 6.dp)) {
+                                        Icon(Icons.Default.Search, null, Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(scanText.scanButton, fontSize = 12.sp)
+                                    }
+                                }
                                 Checkbox(checked = id !in disabledProtocols,
                                     onCheckedChange = { onProtocolEnabled(id, it) })
                             }

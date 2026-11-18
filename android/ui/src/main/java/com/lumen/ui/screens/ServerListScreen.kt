@@ -154,6 +154,7 @@ fun ServerListScreen(
     onRefreshSubscription: (SubscriptionUiModel) -> Unit,
     onRefreshAllSubscriptions: () -> Unit = {},
     onRemoveNoPingServers: () -> Unit = {},
+    onOpenPsiphonScan: () -> Unit = {},
     onToggleFavorite: (NodeUiModel) -> Unit = {},
     onDeleteSubscription: (SubscriptionUiModel) -> Unit,
     onImportFile: () -> Unit = {},
@@ -370,7 +371,8 @@ fun ServerListScreen(
                 onRemoveNoPing = onRemoveNoPingServers,
                 trailing = listToolbar,
                 disabledProtocols = disabledProtocols,
-                onProtocolEnabled = onProtocolEnabledChange)
+                onProtocolEnabled = onProtocolEnabledChange,
+                onOpenPsiphonScan = onOpenPsiphonScan)
 
             // Tor-only bridge type selector appears under the filter bar.
             torControls(protocol)

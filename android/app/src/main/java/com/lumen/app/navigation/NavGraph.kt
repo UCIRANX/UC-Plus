@@ -425,6 +425,7 @@ import com.lumen.ui.screens.ImportPhaseUi
 import com.lumen.ui.screens.LocalStrings
 import com.lumen.ui.screens.TorControlsCard
 import com.lumen.ui.screens.TorCountryRow
+import com.lumen.app.psiphon.PsiphonScanDialog
 import com.lumen.core.config.tor.TorBridges
 import com.lumen.core.config.tor.TorCountries
 import com.lumen.ui.components.ConnectionState
@@ -1638,8 +1639,11 @@ fun LumenApp(
                                 code in torFavoriteCountries, best)
                         }
                     }
+                    val psiphonScanOpen by viewModel.psiphonScanOpen.collectAsStateWithLifecycle()
+                    if (psiphonScanOpen) PsiphonScanDialog(onDismiss = { viewModel.setPsiphonScanOpen(false) })
                     ServerListScreen(
                         onExportLumen = { node -> if (!node.isProtected) lumenExportNode = node },
+                        onOpenPsiphonScan = { viewModel.setPsiphonScanOpen(true) },
                         torControls = { protocol ->
                             if (protocol.equals("tor", ignoreCase = true)) {
                                 TorControlsCard(

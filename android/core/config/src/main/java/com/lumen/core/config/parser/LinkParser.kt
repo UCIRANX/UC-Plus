@@ -528,6 +528,7 @@ object LinkParser {
             "anytls" -> parseAnyTls(text)
             "sstp" -> parseSstp(text)
             "tor" -> parseTor(text)
+            "psiphon" -> parsePsiphon(text)
             else -> throw LinkParseError("Unsupported scheme: ${if (scheme.isEmpty()) "unknown" else scheme}")
         }
     }
@@ -1458,6 +1459,23 @@ object LinkParser {
             name = com.lumen.core.config.tor.TorBridges.displayName(type, host), scheme = "tor",
             server = host, port = port,
             link = com.lumen.core.config.tor.TorBridges.encode(line), outbound = outbound,
+        )
+    }
+
+    /** One Psiphon choice: "auto" or an egress region. The VPN service starts the tunnel core for it. */
+    private fun parsePsiphon(link: String): ParsedNode {
+        val psiphon = com.lumen.core.config.psiphon.PsiphonLinks
+        val region = psiphon.regionOf(link) ?: throw LinkParseError("Invalid Psiphon link")
+        val label = link.substringAfter('#', "").trim()
+        val code = region.ifEmpty { psiphon.AUTO }
+        val outbound = mapOf<String, Any?>(
+            "protocol" to "socks",
+            "settings" to mapOf("servers" to listOf(mapOf("address" to "127.0.0.1", "port" to psiphon.SOCKS_PORT)))
+        )
+        return ParsedNode(
+            name = label.ifEmpty { "Psiphon $code" }, scheme = "psiphon",
+            server = "127.0.0.1", port = psiphon.SOCKS_PORT,
+            link = "psiphon://$code", outbound = outbound,
         )
     }
 

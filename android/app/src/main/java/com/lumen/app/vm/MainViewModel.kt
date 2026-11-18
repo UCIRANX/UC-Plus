@@ -2318,7 +2318,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         "UcOvpn" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UcOvpn.txt",
         "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt",
         // Tor bridges collected by the workflow; one tor:// server per bridge.
-        "Tor" to TorBridges.SUBSCRIPTION_URL
+        "Tor" to TorBridges.SUBSCRIPTION_URL,
+        // Psiphon egress regions, published by the same bridges workflow (psiphon.txt).
+        "Psiphon" to com.lumen.core.config.psiphon.PsiphonLinks.SUBSCRIPTION_URL
     )
 
     /** Inserts every built-in subscription whose URL is not stored yet; returns how many were added. */
@@ -3086,6 +3088,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * best reachable member as the AUTO latency.
      */
     private suspend fun measureNodePing(entity: NodeEntity): Int {
+        // Psiphon has no server of its own to probe: its tunnel exists only while connected.
+        if (entity.protocol.equals("psiphon", ignoreCase = true)) return 0
         // The SOCKS detour only exists while the SSTP bridge runs, so probe the server directly.
         if (entity.protocol.equals("sstp", ignoreCase = true) || entity.protocol.equals("tor", ignoreCase = true)) {
             return tcpPing(entity.server, entity.port)
@@ -3837,9 +3841,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // Tor bootstraps through a bridge, which can take minutes; other servers keep 45 s.
         val selectedIsTor = nodeEntities.value.firstOrNull { it.id == _selectedNodeId.value }
             ?.protocol.equals("tor", ignoreCase = true)
+        val selectedIsPsiphon = nodeEntities.value.firstOrNull { it.id == _selectedNodeId.value }
+            ?.protocol.equals("psiphon", ignoreCase = true)
         connectTimeoutJob = viewModelScope.launch {
             // Tor may try several bridges, each with a long bootstrap, before one connects.
-            delay(if (selectedIsTor) 540_000L else 45_000L)
+            // Psiphon downloads its server entries and then builds a tunnel: give it two minutes.
+            delay(if (selectedIsTor) 540_000L else if (selectedIsPsiphon) 150_000L else 45_000L)
             if (!LumenVpnService.isRunning.value &&
                 _connectionState.value == ConnectionState.Connecting
             ) {
@@ -4090,7 +4097,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         put(com.lumen.core.vpn.ProfilePolicyEnforcer.CONFIG_KEY, policy.toJson()
                             .put("storeHash", selected.link.removePrefix(ProtectedProfileCodec.PREFIX + "store/").substringBefore('/')))
                     }
-                }.toString() else withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson)),
+                }.toString() else withPsiphonSidecar(parsedSelected, withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson))),
             engineType = "SINGBOX",
             splitMode = _splitMode.value.name,
             splitPackages = _splitPackages.value,
@@ -4259,10 +4266,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             .toString()
     }
 
+    /** Psiphon nodes: the VPN service starts the tunnel core for this egress region ("" = auto). */
+    private fun withPsiphonSidecar(parsed: ParsedNode, configJson: String): String {
+        if (!parsed.scheme.equals("psiphon", ignoreCase = true)) return configJson
+        val region = com.lumen.core.config.psiphon.PsiphonLinks.regionOf(parsed.link) ?: return configJson
+        return org.json.JSONObject(configJson)
+            .put("_lumen_psiphon", org.json.JSONObject().put("region", region))
+            .toString()
+    }
+
     /**
      * Protocols the user unchecked in the protocol list. Their servers are hidden from the
      * all-protocols list and skipped by all-protocols ping, but never by subscription refresh.
      */
+    // The Psiphon scan popup (connection protocol, CDN edge IPs and SNI hostnames) over the server list.
+    private val _psiphonScanOpen = MutableStateFlow(false)
+    val psiphonScanOpen: StateFlow<Boolean> = _psiphonScanOpen
+    fun setPsiphonScanOpen(open: Boolean) { _psiphonScanOpen.value = open }
+
     private val _disabledProtocols = MutableStateFlow(
         prefs.getStringSet(K_DISABLED_PROTOCOLS, emptySet()).orEmpty().toSet()
     )

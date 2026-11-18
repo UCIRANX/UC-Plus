@@ -2102,6 +2102,12 @@ object SingboxConfigBuilder {
                 result["server"] = "127.0.0.1"
                 result["server_port"] = com.lumen.core.config.tor.TorBridges.SOCKS_PORT
             }
+            "psiphon" -> {
+                // The Psiphon tunnel core serves SOCKS5 on loopback once its tunnel is up.
+                result["type"] = "socks"
+                result["server"] = "127.0.0.1"
+                result["server_port"] = com.lumen.core.config.psiphon.PsiphonLinks.SOCKS_PORT
+            }
             "socks", "http" -> {
                 result["type"] = scheme
                 result["server"] = node.server
