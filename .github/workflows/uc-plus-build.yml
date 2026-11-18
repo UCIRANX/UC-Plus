@@ -154,7 +154,8 @@ jobs:
         run: |
           ./gradlew lintRelease --continue --no-daemon || true
           mkdir -p lint-report
-          find . -path "*/build/reports/lint-results-release*" -name "*.txt" -exec cp {} lint-report/ \; 2>/dev/null || true
+          # Each module writes a report with the same name, so the copy keeps the module path in the file name.
+          find . -path "*/build/reports/lint-results-release*" -type f -exec sh -c 'cp "$1" "lint-report/$(echo "$1" | sed "s#^\./##; s#/#_#g")"' _ {} \; 2>/dev/null || true
           echo "### Lint: API levels newer than minSdk 26 (NewApi)" >> "$GITHUB_STEP_SUMMARY"
           grep -h "NewApi" lint-report/*.txt 2>/dev/null | head -200 >> "$GITHUB_STEP_SUMMARY" || echo "none found" >> "$GITHUB_STEP_SUMMARY"
 
