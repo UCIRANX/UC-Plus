@@ -51,7 +51,7 @@ TEXT_SOURCES = [
 TELEGRAM_CHANNELS = ["tor_bridges", "vanilla_bridges", "rutorbridgesobfs4webtunnel"]
 TELEGRAM_PAGES = 3
 
-LIMITS = {"webtunnel": 300, "obfs4": 300, "vanilla": 300}  # at most 300 bridges per transport
+LIMITS = {"obfs4": 100, "webtunnel": 100, "vanilla": 300, "snowflake": 100, "meek_lite": 100}  # most bridges per transport
 
 FP = r"[0-9A-Fa-f]{40}"
 ADDR = r"(?:\[[0-9A-Fa-f:]+\]|\d{1,3}(?:\.\d{1,3}){3}):\d{1,5}"
@@ -274,8 +274,8 @@ def main():
         lines = [l for l, _, _ in alive] + [l for l, _ in sorted(v6, key=lambda x: -x[1])]
         result[t] = lines[: LIMITS[t]]
 
-    result["snowflake"] = moat.get("snowflake", [])
-    result["meek_lite"] = moat.get("meek_lite", [])
+    result["snowflake"] = moat.get("snowflake", [])[: LIMITS["snowflake"]]
+    result["meek_lite"] = moat.get("meek_lite", [])[: LIMITS["meek_lite"]]
     total = sum(len(v) for v in result.values())
     if total == 0:
         log("No bridges collected at all, refusing to publish an empty list.")

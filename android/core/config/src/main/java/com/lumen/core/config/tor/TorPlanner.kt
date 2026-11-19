@@ -7,9 +7,6 @@ package com.lumen.core.config.tor
  */
 object TorPlanner {
     private val ORDER = listOf("webtunnel", "snowflake", "obfs4", "meek_lite", "vanilla")
-    private const val PER_TYPE = 12
-    /** Most bridges tried per transport. */
-    private val LIMITS = mapOf("obfs4" to 100, "webtunnel" to 100, "vanilla" to 300, "snowflake" to 100, "meek_lite" to 100)
 
     /**
      * [types] limits the transports to try (null means all). [lastGoodLine] is tried first
@@ -23,9 +20,7 @@ object TorPlanner {
         if (first != null && (types == null || TorBridges.typeOf(first) in types)) result += first
         for (t in ORDER) {
             if (types != null && t !in types) continue
-            val list = groups[t].orEmpty().filter { it != first }.shuffled()
-            val limit = LIMITS[t] ?: PER_TYPE
-            result += list.take(limit)
+            result += groups[t].orEmpty().filter { it != first }.shuffled()
         }
         return result
     }
