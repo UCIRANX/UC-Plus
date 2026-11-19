@@ -82,7 +82,7 @@ object NotificationHelper {
     private var lastPostedKey: String? = null
 
     /** The same resource as the QS tile; a direct reference also survives R8. */
-    private fun smallIcon(): Int = smallIconRes.takeIf { it != 0 } ?: R.drawable.ic_qs_lumen
+    private fun smallIcon(): Int = smallIconRes.takeIf { it != 0 } ?: R.drawable.ic_status_uc
 
     fun settings(context: Context): NotificationSettings {
         val prefs = context.getSharedPreferences(
@@ -267,6 +267,7 @@ object NotificationHelper {
         val ongoing = stage != Stage.DISCONNECTED
         val builder = NotificationCompat.Builder(context, channelIdFor(settings))
             .setSmallIcon(icon)
+            .setColor(0xFF39FF14.toInt())
             .setContentTitle(title(settings, server, stage))
             .setOngoing(ongoing)
             .setOnlyAlertOnce(true)
@@ -321,6 +322,7 @@ object NotificationHelper {
     ): Notification =
         NotificationCompat.Builder(context, channelIdFor(settings))
             .setSmallIcon(icon)
+            .setColor(0xFF39FF14.toInt())
             .setContentTitle(
                 when (stage) {
                     Stage.CONNECTED -> "UC Plus VPN is on"

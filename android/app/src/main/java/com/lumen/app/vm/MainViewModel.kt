@@ -2322,9 +2322,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /** Subscriptions the app ships with. They are added when missing and cannot be removed in the UI. */
     private val builtInSubscriptions = listOf(
         "UcAmnezia" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcAmnezia.txt",
-        "UcSubot" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcSubot.txt",
-        "Uciran" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciran.txt",
-        "Uciranir" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciranir.txt",
+        "CafeWhale" to "https://raw.githubusercontent.com/CafeWhale/UC/refs/heads/main/output/sub.txt",
+        "UCX" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UCX.txt",
         "UcOvpn" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UcOvpn.txt",
         "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt",
         // Tor bridges collected by the workflow; one tor:// server per bridge.
@@ -2333,8 +2332,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         "Psiphon" to com.lumen.core.config.psiphon.PsiphonLinks.SUBSCRIPTION_URL
     )
 
+    /** Built-in subscriptions that were removed from the app; any stored copy is deleted. */
+    private val removedBuiltInSubscriptionUrls = setOf(
+        "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcSubot.txt",
+        "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciran.txt",
+        "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/Uciranir.txt",
+    )
+
     /** Inserts every built-in subscription whose URL is not stored yet; returns how many were added. */
     private suspend fun addMissingBuiltInSubscriptions(): Int = subscriptionMutations.withLock {
+        subscriptionDao.getSubscriptions().first()
+            .filter { it.url in removedBuiltInSubscriptionUrls }
+            .forEach { subscriptionDao.deleteSubscriptionById(it.id) }
         val known = subscriptionDao.getSubscriptions().first().map { it.url }.toSet()
         val missing = builtInSubscriptions.filter { (_, url) -> url !in known }
         missing.forEach { (name, url) ->
@@ -2432,6 +2441,39 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         refreshSubscription(model)
     }
 
+    /**
+     * A subscription can list other subscriptions. Their configs are collected too, two levels deep,
+     * each address once; a nested address that fails is logged and skipped.
+     */
+    private suspend fun nestedSubscriptionBodies(
+        ownUrl: String,
+        body: String,
+        fetchOne: suspend (String) -> String,
+    ): String {
+        val seen = hashSetOf(ownUrl)
+        val out = StringBuilder()
+        suspend fun walk(text: String, depth: Int) {
+            if (depth > 2) return
+            val urls = text.lineSequence().map { it.trim() }
+                .filter { (it.startsWith("https://") || it.startsWith("http://")) && seen.add(it) }
+                .take(50).toList()
+            for (url in urls) {
+                val nested = try {
+                    fetchOne(url)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (e: Exception) {
+                    log("Nested subscription skipped: ${e.message ?: e.javaClass.simpleName}")
+                    continue
+                }
+                out.append('\n').append(nested)
+                walk(nested, depth + 1)
+            }
+        }
+        walk(body, 1)
+        return out.toString()
+    }
+
     private suspend fun refreshSubscriptionInternal(
         sub: SubscriptionEntity,
         rethrow: Boolean = false,
@@ -2477,7 +2519,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
             currentCoroutineContext().ensureActive()
             if (!accepts(subscriptionDao.getSubscriptionSnapshot(sub.id))) return 0
-            val (parsed, errors) = LinkParser.parseLinksText(payload.body)
+            val nestedBody = nestedSubscriptionBodies(requested.url, payload.body) { url ->
+                SubscriptionClient.fetch(
+                    rawUrl = url,
+                    hwid = subscriptionSettings.subscriptionHwid.trim()
+                        .takeIf { subscriptionSettings.subscriptionSendHwid && it.isNotBlank() },
+                    customUserAgent = subscriptionSettings.subscriptionUserAgent.trim().ifBlank { null },
+                    direct = subscriptionSettings.subscriptionDirect,
+                    allowHttp = subscriptionSettings.subscriptionAllowHttp,
+                    proxyPort = subscriptionSettings.localSocksPort.takeIf {
+                        subscriptionSettings.subscriptionUseProxyTun && LumenVpnService.isRunning.value
+                    },
+                    proxyUsername = subscriptionSettings.socks5Username.takeIf { subscriptionSettings.socks5AuthEnabled },
+                    proxyPassword = subscriptionSettings.socks5Password.takeIf { subscriptionSettings.socks5AuthEnabled },
+                ).body
+            }
+            val (parsed, errors) = LinkParser.parseLinksText(payload.body + nestedBody)
             errors.take(3).forEach { log("Subscription warning: $it") }
             val valid = parsed.filter {
                 it.name.length <= 512 && it.server.length <= 512 &&
