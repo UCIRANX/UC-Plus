@@ -374,6 +374,8 @@ object LinkParser {
                     currentLine = IncyCrypt.decryptIncyLink(currentLine).trim()
                     if (isSubscriptionUrl(currentLine)) throw LinkParseError(INCY_SUBSCRIPTION_ERROR)
                 }
+                // A plain subscription address (no user:pass@) is fetched by the refresh, not a proxy node.
+                if (isSubscriptionUrl(currentLine) && !currentLine.contains('@')) continue
                 if (currentLine.startsWith("{") || currentLine.startsWith("[") || currentLine.startsWith(34.toChar())) {
                     val (inner, innerErrors) = parseLinksTextInternal(currentLine, depth + 1)
                     nodes.addAll(inner)

@@ -30,6 +30,9 @@ internal fun canApplySubscriptionRefresh(
 
 internal fun canReplaceSubscriptionNodes(
     previousCount: Int, parsedCount: Int, validCount: Int, parseErrorCount: Int
-): Boolean = validCount > 0 && (previousCount == 0 || (
-    parseErrorCount == 0 && parsedCount == validCount
-    ))
+): Boolean = validCount > 0 && (previousCount == 0 ||
+    // A clean parse always replaces. Bad entries are skipped, unless the rest is less than half
+    // of the previous list, which is what a broken format looks like.
+    (parseErrorCount == 0 && parsedCount == validCount) ||
+    validCount * 2 >= previousCount
+    )
