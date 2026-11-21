@@ -30,9 +30,9 @@ object PsiphonPrefs {
     /** The SNI list as typed: commas, spaces or new lines between hostnames. */
     private const val KEY_BEAST = "beast_mode"
 
-    /** Beast Mode: try every protocol on every server. Shown in the scan section of the popup. */
-    fun beastMode(context: Context): Boolean =
-        runCatching { prefs(context).getBoolean(KEY_BEAST, true) }.getOrDefault(true)
+    /** Beast Mode is always on: try every protocol on every server. It has no switch in the popup. */
+    @Suppress("UNUSED_PARAMETER")
+    fun beastMode(context: Context): Boolean = true
 
     fun setBeastMode(context: Context, on: Boolean) {
         runCatching { prefs(context).edit().putBoolean(KEY_BEAST, on).apply() }

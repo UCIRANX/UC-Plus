@@ -1,6 +1,7 @@
 package com.lumen.app.psiphon
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -14,7 +15,6 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -24,9 +24,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -51,7 +51,6 @@ fun PsiphonScanDialog(onDismiss: () -> Unit) {
     var modeMenu by remember { mutableStateOf(false) }
     var edgeIps by remember { mutableStateOf(CdnEdgeIpPreferences.load(context)) }
     var sni by remember { mutableStateOf(PsiphonPrefs.cdnSni(context)) }
-    var beast by remember { mutableStateOf(PsiphonPrefs.beastMode(context)) }
     var rangesText by remember { mutableStateOf(CdnIpScanner.DEFAULT_AKAMAI_RANGES.joinToString("\n")) }
     var manualText by remember { mutableStateOf("") }
     // Healthy IPs found by the scanner are saved in the same list; show them while the scan runs.
@@ -133,31 +132,24 @@ fun PsiphonScanDialog(onDismiss: () -> Unit) {
                     maxLines = 3,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(t.beastMode, fontWeight = FontWeight.Bold)
-                        Text(t.beastModeDesc, fontSize = 12.sp)
-                    }
-                    Switch(
-                        checked = beast,
-                        onCheckedChange = {
-                            beast = it
-                            PsiphonPrefs.setBeastMode(context, it)
-                        },
-                    )
-                }
                 Text(t.progress(scan.scanned, scan.healthy))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                     TextButton(
                         onClick = { CdnIpScanner.start(context, rangesText, manualText, manualMode = false) },
                         modifier = Modifier.weight(1f),
-                    ) { Text(t.scanRanges, maxLines = 1, fontSize = 13.sp) }
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                    ) { Text(t.scanRanges, maxLines = 2, textAlign = TextAlign.Center, fontSize = 13.sp) }
                     TextButton(
                         onClick = { CdnIpScanner.start(context, rangesText, manualText, manualMode = true) },
                         modifier = Modifier.weight(1f),
-                    ) { Text(t.scanManual, maxLines = 1, fontSize = 13.sp) }
-                    TextButton(onClick = { CdnIpScanner.stop() }, modifier = Modifier.weight(1f)) {
-                        Text(t.stop, maxLines = 1, fontSize = 13.sp)
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                    ) { Text(t.scanManual, maxLines = 2, textAlign = TextAlign.Center, fontSize = 13.sp) }
+                    TextButton(
+                        onClick = { CdnIpScanner.stop() },
+                        modifier = Modifier.weight(1f),
+                        contentPadding = PaddingValues(horizontal = 2.dp),
+                    ) {
+                        Text(t.stop, maxLines = 2, textAlign = TextAlign.Center, fontSize = 13.sp)
                     }
                 }
             }
