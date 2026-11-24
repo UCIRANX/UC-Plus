@@ -36,6 +36,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import com.lumen.core.vpn.openconnect.OpenConnectSettings
 import com.lumen.core.vpn.openconnect.OpenConnectTunnel
 import org.amnezia.awg.hevtunnel.TProxyService
@@ -54,6 +55,11 @@ class LumenVpnService : VpnService() {
 
     @Volatile
     private var openConnectTunnel: OpenConnectTunnel? = null
+    // The loop that runs libopenconnect's mainloop; the stop waits for it before freeing the engine.
+    @Volatile private var openConnectLoop: Job? = null
+    // True while libopenconnect is signing in. Its blocking calls cannot be interrupted by a coroutine
+    // cancel, so the stop only cancels them and the start path frees the engine when they return.
+    @Volatile private var openConnectSigningIn = false
     @Volatile private var vpnInterface: ParcelFileDescriptor? = null
     private val tunnelStarted = AtomicBoolean(false)
     // bringUpRuntime/stopRuntime are reachable from five independent coroutines;
@@ -315,12 +321,23 @@ class LumenVpnService : VpnService() {
         val tunnel = OpenConnectTunnel(settings) { fd -> protect(fd) }
         openConnectTunnel = tunnel
         VpnLogBus.info("OpenConnect", "Connecting to ${settings.server}:${settings.port}")
+        openConnectSigningIn = true
         val ip = try {
             withContext(Dispatchers.IO) { tunnel.connect() }
         } catch (t: Throwable) {
             tunnel.close()
-            openConnectTunnel = null
+            if (openConnectTunnel === tunnel) openConnectTunnel = null
+            if (tunnel.isCancelled && t !is CancellationException) {
+                throw CancellationException("OpenConnect stopped by the user")
+            }
             throw t
+        } finally {
+            openConnectSigningIn = false
+        }
+        if (tunnel.isCancelled) {
+            tunnel.close()
+            if (openConnectTunnel === tunnel) openConnectTunnel = null
+            throw CancellationException("OpenConnect stopped by the user")
         }
 
         val builder = Builder()
@@ -356,10 +373,11 @@ class LumenVpnService : VpnService() {
 
         // The engine loop blocks until the tunnel ends. A cancel (user stop) returns null here;
         // any other end stops the VPN service so the app shows it as disconnected.
-        serviceScope.launch(Dispatchers.IO) {
+        openConnectLoop = serviceScope.launch(Dispatchers.IO) {
             val reason = tunnel.mainloop()
             tunnel.close()
-            if (reason != null) {
+            // Only a tunnel that is still the current one may end the service; a newer connection must survive.
+            if (reason != null && openConnectTunnel === tunnel) {
                 VpnLogBus.error("OpenConnect", reason)
                 stopVpn()
             }
@@ -1336,6 +1354,9 @@ ${hevAuthLines}misc:
         val stoppingStartId = lastStartId
         // A user initiated stop must not be undone by a pending network reconnect.
         unregisterNetworkMonitor()
+        // Cancel the OpenConnect sign-in right away. It is blocking native code, so the
+        // stop below waits on the runtime lock, which the start holds until the sign-in returns.
+        openConnectTunnel?.cancel()
         startJob?.cancel()
         startJob = null
         restartJob?.cancel()
@@ -1387,6 +1408,27 @@ ${hevAuthLines}misc:
         obfsRelay = null
     }
 
+    /**
+     * Ends the OpenConnect session. libopenconnect still reads and writes the TUN fd while its loop
+     * runs, so the engine is freed only after the loop has returned. A sign-in still in progress is
+     * left to the start path: it frees the engine when the blocking sign-in call returns.
+     */
+    private suspend fun stopOpenConnectLocked() {
+        val tunnel = openConnectTunnel ?: return
+        openConnectTunnel = null
+        tunnel.cancel()
+        val loop = openConnectLoop
+        openConnectLoop = null
+        if (openConnectSigningIn) return
+        val finished = loop == null || withTimeoutOrNull(8_000L) { loop.join() } != null
+        if (finished) {
+            tunnel.close()
+        } else {
+            // The loop closes the engine itself when it returns, so nothing is freed under it now.
+            VpnLogBus.warning("OpenConnect", "The engine is still closing; it is freed when its loop ends")
+        }
+    }
+
     private suspend fun stopRuntime(closeInterface: Boolean) = runtimeMutex.withLock {
         stopRuntimeLocked(closeInterface)
     }
@@ -1418,8 +1460,7 @@ ${hevAuthLines}misc:
         sstpSidecar = null
         com.lumen.core.vpn.tor.TorSidecar.stop(applicationContext)
         com.lumen.core.vpn.psiphon.PsiphonSidecar.stop()
-        openConnectTunnel?.cancel()
-        openConnectTunnel = null
+        stopOpenConnectLocked()
         if (closeInterface) {
             runCatching { vpnInterface?.close() }
             vpnInterface = null

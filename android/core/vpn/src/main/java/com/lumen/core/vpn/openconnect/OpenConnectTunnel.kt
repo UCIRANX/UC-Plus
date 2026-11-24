@@ -49,7 +49,13 @@ class OpenConnectTunnel(
     @Volatile
     private var cancelled = false
 
-    /** Logs in and opens the tunnel. Blocking. Throws IllegalStateException with a readable message. */
+    /** True once the user (or the service) asked this session to stop. */
+    val isCancelled: Boolean get() = cancelled
+
+    /**
+     * Logs in and opens the tunnel. Blocking. Throws IllegalStateException with a readable message.
+     * A [cancel] during the sign-in makes the blocking calls return, and the steps after them are skipped.
+     */
     fun connect(): LibOpenConnect.IPInfo {
         val loadError = runCatching { System.loadLibrary("openconnect") }.exceptionOrNull()
         if (loadError != null) {
@@ -62,8 +68,11 @@ class OpenConnectTunnel(
         runCatching { s.setSystemTrust(true) }
         val host = settings.server.removePrefix("https://").removePrefix("http://").substringBefore("/")
         if (s.parseURL("https://$host:${settings.port}") != 0) throw fail("the server address could not be read")
-        if (s.obtainCookie() != 0) throw fail("sign-in failed: check the username, password and group")
-        if (s.makeCSTPConnection() != 0) throw fail("the server accepted sign-in but did not open the tunnel")
+        if (cancelled) throw Stopped()
+        if (s.obtainCookie() != 0) throw if (cancelled) Stopped() else fail("sign-in failed: check the username, password and group")
+        if (cancelled) throw Stopped()
+        if (s.makeCSTPConnection() != 0) throw if (cancelled) Stopped() else fail("the server accepted sign-in but did not open the tunnel")
+        if (cancelled) throw Stopped()
         return s.getIPInfo() ?: throw fail("the server sent no address settings")
     }
 
@@ -84,7 +93,11 @@ class OpenConnectTunnel(
         runCatching { session?.cancel() }
     }
 
-    /** Frees the engine. Call it only after [mainloop] has returned. */
+    /**
+     * Frees the engine. Call it only after [mainloop] has returned, or when no loop was ever
+     * started. Safe to call more than once: the engine is freed once.
+     */
+    @Synchronized
     fun close() {
         val s = session
         session = null
@@ -95,6 +108,9 @@ class OpenConnectTunnel(
         VpnLogBus.error(TAG, "OpenConnect: $reason")
         return IllegalStateException("OpenConnect: $reason")
     }
+
+    /** The user stopped the connection while it was being made. This is not an error. */
+    private class Stopped : java.util.concurrent.CancellationException("OpenConnect stopped by the user")
 
     private companion object {
         const val TAG = "OpenConnect"
