@@ -137,6 +137,12 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: bash android/tools/build_native_libs.sh
 
+      - name: Build libopenconnect (OpenConnect engine)
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash android/native/build-openconnect.sh
+
       - name: Build signed release APKs
         working-directory: android
         env:

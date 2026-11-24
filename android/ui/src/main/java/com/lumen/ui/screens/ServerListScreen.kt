@@ -115,6 +115,7 @@ private val PROTOCOL_DISPLAY_ORDER = listOf(
     setOf("psiphon"),
     setOf("tor"),
     setOf("sstp"),
+    setOf("openconnect"),
     setOf("openvpn"),
     setOf("shadowsocks", "ss"),
     setOf("vless"),

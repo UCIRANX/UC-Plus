@@ -28,7 +28,7 @@
 
 | | امکان | توضیح |
 |:-:|---|---|
-| 🔌 | **چند پروتکل** | AmneziaWG، Psiphon، Tor، SSTP، OpenVPN، Shadowsocks، VLESS و Hysteria 2 |
+| 🔌 | **چند پروتکل** | AmneziaWG، Psiphon، Tor، SSTP، OpenConnect، OpenVPN، Shadowsocks، VLESS و Hysteria 2 |
 | 📥 | **ساب‌لینک** | ورود گروهی سرورها از لینک اشتراک، با بروزرسانی دستی یا خودکار |
 | 🔗 | **ساب‌لینک تودرتو** | اگر داخل یک ساب‌لینک، لینک ساب‌لینک دیگری باشد، تا دو سطح دریافت می‌شود |
 | 🧅 | **Tor Auto** | یک ردیف خودکار که بهترین کشور Tor را بر اساس پینگ انتخاب می‌کند |
@@ -84,6 +84,7 @@
 | UCsstp | سرورهای SSTP |
 | Tor | بریج‌های Tor (وب‌تانل، obfs4، vanilla، snowflake، meek_lite) |
 | Psiphon | سرورهای Psiphon (هر ۶ ساعت بروزرسانی می‌شود) |
+| UcPlus | سرورهای OpenConnect و سایر پروتکل‌های UC Plus |
 
 - ساب‌لینک‌های اضافه‌شده توسط خود کاربر هم پشتیبانی می‌شوند.
 - اگر ساب‌لینکی خط خراب داشته باشد، خط‌های خراب نادیده گرفته می‌شوند و بقیه‌ی سرورها بروزرسانی می‌شوند.
@@ -100,12 +101,19 @@
 | Psiphon | psiphon-tunnel-core | `psiphon://` |
 | Tor | Tor (بریج‌ها) | بریج‌های ساب‌لینک Tor |
 | SSTP | SSTP bridge | `host:port:user:pass:CC` |
+| OpenConnect | libopenconnect (AnyConnect) | `OPENCONNECT:server:port:user:pass:authgroup:certpin:name:country` |
 | OpenVPN | OpenVPN | `udp\|tcp:CC:base64` |
 | Shadowsocks | sing-box | `ss://` |
 | VLESS | sing-box / Xray | `vless://` |
 | Hysteria 2 | sing-box | `hy2://` |
 
-ترتیب نمایش پروتکل‌ها در منو: All Protocols، AWG، Psiphon، Tor، SSTP، OpenVPN، Shadowsocks، VLESS، Hysteria 2.
+ترتیب نمایش پروتکل‌ها در منو: All Protocols، AWG، Psiphon، Tor، SSTP، OpenConnect، OpenVPN، Shadowsocks، VLESS، Hysteria 2.
+
+## 🔐 OpenConnect
+
+- هر خط ساب‌لینک به این شکل است: `OPENCONNECT:server:port:user:pass:authgroup:certpin:name:country`. فیلدهای خالی، مقدار خالی هستند.
+- موتور **libopenconnect** (نسخه 9.21) همراه OpenSSL و libxml2 ساخته می‌شود؛ اسکریپت آن `android/native/build-openconnect.sh` است.
+- تونل را خود موتور باز می‌کند؛ بنابراین برای این نوع سرور، sing-box و hev شروع نمی‌شوند.
 
 <br>
 

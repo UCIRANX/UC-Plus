@@ -9,6 +9,9 @@ Preserved copyright notices:
 
 - Copyright (c) 2026 youtubediscord/zapret-kvn contributors
 - Copyright (c) 2026 krambovic/Lumen contributors
+- Copyright (c) 2013 Kevin Cernekee (libopenconnect Java binding, LibOpenConnect.java) — LGPL-2.1
+- openconnect 9.21 (LGPL-2.1): https://www.infradead.org/openconnect/ — built by android/native/build-openconnect.sh
+- OpenTunnel (AlieShayan, LGPL-2.1): the OpenConnect build layout and the OpenTunnel LGPL-2.1 text are in licenses/OPENTUNNEL-LGPL-2.1.txt
 
 Relevant source and attribution links:
 
@@ -28,3 +31,6 @@ Optional external helpers downloaded or used separately:
   GPL-3.0 component used as a separate helper for Discord TCP/UDP SOCKS5
   proxying via Discord-local DLL loading and Squirrel updater hook. Its source
   code is not embedded into this repository.
+
+- openconnect 9.21 (LGPL-2.1), OpenSSL 3.0.x (Apache-2.0), libxml2 (MIT) and lz4 (BSD-2-Clause), as upstream: built into libopenconnect.so by
+  android/native/build-openconnect.sh. The Java binding LibOpenConnect.java is LGPL-2.1.

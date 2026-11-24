@@ -506,6 +506,11 @@ object LinkParser {
             return parseJsonOutbound(text)
         }
 
+        // OpenConnect lines are not URLs: OPENCONNECT:server:port:user:password:group:pin:name:country.
+        if (com.lumen.core.config.openconnect.OpenConnectLinks.isOpenConnectLine(text)) {
+            return parseOpenConnect(text)
+        }
+
         val scheme = try {
             val idx = text.indexOf("://")
             if (idx != -1) text.substring(0, idx).lowercase() else ""
@@ -1461,6 +1466,23 @@ object LinkParser {
             name = com.lumen.core.config.tor.TorBridges.displayName(type, host), scheme = "tor",
             server = host, port = port,
             link = com.lumen.core.config.tor.TorBridges.encode(line), outbound = outbound,
+        )
+    }
+
+    /**
+     * One OpenConnect server. The VPN service runs libopenconnect for it (see MainViewModel's
+     * `_lumen_openconnect`); the outbound is a placeholder that is never started.
+     */
+    private fun parseOpenConnect(line: String): ParsedNode {
+        val server = com.lumen.core.config.openconnect.OpenConnectLinks.parse(line)
+            ?: throw LinkParseError("Invalid OpenConnect line")
+        return ParsedNode(
+            name = server.name,
+            scheme = com.lumen.core.config.openconnect.OpenConnectLinks.SCHEME,
+            server = server.server,
+            port = server.port,
+            link = line.trim(),
+            outbound = mapOf("type" to "direct", "tag" to "proxy"),
         )
     }
 

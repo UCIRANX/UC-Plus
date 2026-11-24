@@ -2324,6 +2324,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         "UcAmnezia" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcAmnezia.txt",
         "CafeWhale" to "https://raw.githubusercontent.com/CafeWhale/UC/refs/heads/main/output/sub.txt",
         "UCX" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UCX.txt",
+        "UcPlus" to "https://raw.githubusercontent.com/UCIRANX/Vpn/refs/heads/main/UcPlus.txt",
         "UcOvpn" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UcOvpn.txt",
         "UCsstp" to "https://raw.githubusercontent.com/UCIRANX/Comp/refs/heads/main/UCsstp.txt",
         // Tor bridges collected by the workflow; one tor:// server per bridge.
@@ -4180,7 +4181,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         put(com.lumen.core.vpn.ProfilePolicyEnforcer.CONFIG_KEY, policy.toJson()
                             .put("storeHash", selected.link.removePrefix(ProtectedProfileCodec.PREFIX + "store/").substringBefore('/')))
                     }
-                }.toString() else withPsiphonSidecar(parsedSelected, withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson))),
+                }.toString() else withOpenConnect(parsedSelected, withPsiphonSidecar(parsedSelected, withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson)))),
             engineType = "SINGBOX",
             splitMode = _splitMode.value.name,
             splitPackages = _splitPackages.value,
@@ -4347,6 +4348,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         return org.json.JSONObject(configJson)
             .put("_lumen_tor", org.json.JSONObject().put("candidates", candidates))
             .toString()
+    }
+
+    /** OpenConnect nodes: the VPN service runs libopenconnect with these settings instead of sing-box. */
+    private fun withOpenConnect(parsed: ParsedNode, configJson: String): String {
+        if (!parsed.scheme.equals(com.lumen.core.config.openconnect.OpenConnectLinks.SCHEME, ignoreCase = true)) return configJson
+        val server = com.lumen.core.config.openconnect.OpenConnectLinks.parse(parsed.link) ?: return configJson
+        return runCatching {
+            JSONObject(configJson).put(
+                com.lumen.core.vpn.openconnect.OpenConnectSettings.KEY,
+                JSONObject()
+                    .put("server", server.server)
+                    .put("port", server.port)
+                    .put("user", server.username)
+                    .put("password", server.password)
+                    .put("group", server.authGroup)
+                    .put("pin", server.certPin),
+            ).toString()
+        }.getOrDefault(configJson)
     }
 
     /** Psiphon nodes: the VPN service starts the tunnel core for this egress region ("" = auto). */

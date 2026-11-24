@@ -35,6 +35,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import com.lumen.core.vpn.openconnect.OpenConnectSettings
+import com.lumen.core.vpn.openconnect.OpenConnectTunnel
 import org.amnezia.awg.hevtunnel.TProxyService
 import java.io.File
 import java.io.InputStream
@@ -48,6 +51,9 @@ import kotlin.concurrent.thread
 
 class LumenVpnService : VpnService() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    @Volatile
+    private var openConnectTunnel: OpenConnectTunnel? = null
     @Volatile private var vpnInterface: ParcelFileDescriptor? = null
     private val tunnelStarted = AtomicBoolean(false)
     // bringUpRuntime/stopRuntime are reachable from five independent coroutines;
@@ -300,6 +306,66 @@ class LumenVpnService : VpnService() {
         watchProfilePolicy(policy)
     }
 
+    /**
+     * OpenConnect nodes: libopenconnect logs in, opens the tunnel and owns the TUN device, so no
+     * sing-box core, hev tunnel or Xray/SSTP sidecar is started for them.
+     */
+    private suspend fun bringUpOpenConnectLocked(settings: OpenConnectSettings, params: StartParams) {
+        startForegroundCompat(NotificationHelper.buildConnectingNotification(this))
+        val tunnel = OpenConnectTunnel(settings) { fd -> protect(fd) }
+        openConnectTunnel = tunnel
+        VpnLogBus.info("OpenConnect", "Connecting to ${settings.server}:${settings.port}")
+        val ip = try {
+            withContext(Dispatchers.IO) { tunnel.connect() }
+        } catch (t: Throwable) {
+            tunnel.close()
+            openConnectTunnel = null
+            throw t
+        }
+
+        val builder = Builder()
+            .setMtu(params.mtu)
+            .addAddress(ip.addr, OpenConnectSettings.prefixOf(ip.netmask))
+            .addRoute("0.0.0.0", 0)
+            .setSession("OpenConnect ${settings.server}")
+            .setBlocking(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
+        val dns = ip.DNS.orEmpty().filter { it.isNotBlank() }
+        if (dns.isEmpty()) builder.addDnsServer(OPENCONNECT_FALLBACK_DNS) else dns.forEach(builder::addDnsServer)
+        val effectiveSplit = SplitTunnelingManager.withoutOwnPackage(params.splitConfig, packageName)
+        SplitTunnelingManager.requireSafeAllowList(effectiveSplit)
+        val appliedSplit = SplitTunnelingManager.applySplitTunneling(builder, effectiveSplit)
+        SplitTunnelingManager.requireSafeAllowList(effectiveSplit, appliedSplit)
+        if (SplitTunnelingManager.requiresSelfDisallow(effectiveSplit.mode, appliedSplit)) {
+            builder.addDisallowedApplication(packageName)
+        }
+        val pfd = checkNotNull(builder.establish()) { "Failed to establish VPN interface" }
+        vpnInterface = pfd
+        if (!tunnel.attachTun(pfd.fd)) {
+            tunnel.close()
+            openConnectTunnel = null
+            error("OpenConnect could not use the VPN interface")
+        }
+
+        _isRunning.value = true
+        NotificationHelper.invalidate()
+        startForegroundCompat(NotificationHelper.buildNotification(this, isConnected = true))
+        reportNotificationVisibility()
+        notifyWidgets()
+        VpnLogBus.info("OpenConnect", "Tunnel is up (${ip.addr})")
+
+        // The engine loop blocks until the tunnel ends. A cancel (user stop) returns null here;
+        // any other end stops the VPN service so the app shows it as disconnected.
+        serviceScope.launch(Dispatchers.IO) {
+            val reason = tunnel.mainloop()
+            tunnel.close()
+            if (reason != null) {
+                VpnLogBus.error("OpenConnect", reason)
+                stopVpn()
+            }
+        }
+    }
+
     private suspend fun bringUpRuntimeLocked(params: StartParams) {
         val engineType = params.engineType
         val mtu = params.mtu
@@ -310,6 +376,10 @@ class LumenVpnService : VpnService() {
         // briefly leaking it outside the VPN.
         val blockingInterface = vpnInterface.takeIf { restartingForNetwork }
         stopRuntimeLocked(closeInterface = blockingInterface == null)
+        OpenConnectSettings.fromConfig(params.configJson)?.let { settings ->
+            bringUpOpenConnectLocked(settings, params)
+            return
+        }
         // Capture the real path before Android publishes the replacement VPN.
         val connectivityManager = getSystemService(ConnectivityManager::class.java)
         val underlay = connectivityManager?.let(::currentUnderlyingNetwork)
@@ -1348,6 +1418,8 @@ ${hevAuthLines}misc:
         sstpSidecar = null
         com.lumen.core.vpn.tor.TorSidecar.stop(applicationContext)
         com.lumen.core.vpn.psiphon.PsiphonSidecar.stop()
+        openConnectTunnel?.cancel()
+        openConnectTunnel = null
         if (closeInterface) {
             runCatching { vpnInterface?.close() }
             vpnInterface = null
@@ -1478,6 +1550,7 @@ ${hevAuthLines}misc:
         fun setUiVisible(visible: Boolean) { uiVisible = visible }
 
         private const val TAG = "LumenVpnService"
+        private const val OPENCONNECT_FALLBACK_DNS = "8.8.8.8"
         private const val LOCAL_SOCKS_PORT = 10808
         private const val PREF_VALIDATE_PROXY_DATA_PATH = "validate_proxy_data_path"
         private const val PREF_PING_URL = "ping_url"
