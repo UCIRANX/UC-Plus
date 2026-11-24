@@ -4181,7 +4181,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         put(com.lumen.core.vpn.ProfilePolicyEnforcer.CONFIG_KEY, policy.toJson()
                             .put("storeHash", selected.link.removePrefix(ProtectedProfileCodec.PREFIX + "store/").substringBefore('/')))
                     }
-                }.toString() else withOpenConnect(parsedSelected, withPsiphonSidecar(parsedSelected, withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson)))),
+                }.toString() else withOpenConnect(selected.link, withPsiphonSidecar(parsedSelected, withTorSidecar(parsedSelected, withSstpSidecar(parsedSelected, configJson)))),
             engineType = "SINGBOX",
             splitMode = _splitMode.value.name,
             splitPackages = _splitPackages.value,
@@ -4351,9 +4351,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** OpenConnect nodes: the VPN service runs libopenconnect with these settings instead of sing-box. */
-    private fun withOpenConnect(parsed: ParsedNode, configJson: String): String {
-        if (!parsed.scheme.equals(com.lumen.core.config.openconnect.OpenConnectLinks.SCHEME, ignoreCase = true)) return configJson
-        val server = com.lumen.core.config.openconnect.OpenConnectLinks.parse(parsed.link) ?: return configJson
+    private fun withOpenConnect(link: String, configJson: String): String {
+        // The stored link, not the parsed node: a stored node is rebuilt from its normalized
+        // outbound (type "direct"), so the parsed node does not keep the OpenConnect line.
+        val server = com.lumen.core.config.openconnect.OpenConnectLinks.parse(link) ?: return configJson
         return runCatching {
             JSONObject(configJson).put(
                 com.lumen.core.vpn.openconnect.OpenConnectSettings.KEY,
