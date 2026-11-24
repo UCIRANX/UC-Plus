@@ -37,3 +37,11 @@
 -dontwarn org.torproject.**
 -dontwarn IPtProxy.**
 -dontwarn info.guardianproject.**
+
+# OpenConnect (libopenconnect.so) is JNI-backed: native init() looks up fields such as
+# asyncLock/libctx by name and the callbacks (onProgress, onProcessAuthForm, ...) by name.
+# R8 renames or strips them in release builds, so GetFieldID returns null and the process
+# aborts with "fid == null". Keep the binding and our session class whole.
+-keep class org.infradead.libopenconnect.** { *; }
+-keep class com.lumen.core.vpn.openconnect.** { *; }
+-dontwarn org.infradead.libopenconnect.**
