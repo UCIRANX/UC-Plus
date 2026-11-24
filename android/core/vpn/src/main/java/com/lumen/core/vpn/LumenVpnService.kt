@@ -365,6 +365,9 @@ class LumenVpnService : VpnService() {
         }
 
         _isRunning.value = true
+        // Same session bookkeeping as the sing-box path: start time, totals, speed and notification.
+        ensureSessionStarted()
+        startTrafficStats()
         NotificationHelper.invalidate()
         startForegroundCompat(NotificationHelper.buildNotification(this, isConnected = true))
         reportNotificationVisibility()
@@ -1266,7 +1269,9 @@ ${hevAuthLines}misc:
             val power = getSystemService(android.os.PowerManager::class.java)
             val statsPreferences = getSharedPreferences(VpnStartIntentFactory.PREFS_NAME, MODE_PRIVATE)
             val uid = Process.myUid()
-            val proxyOnly = activeParams?.proxyOnly == true
+            // Proxy-only and OpenConnect have no hev TUN counters, so they read the app's UID counters.
+            // OpenConnect's own tunnel is a protected socket of this app, so its bytes are counted there.
+            val proxyOnly = activeParams?.proxyOnly == true || openConnectTunnel != null
             var previous = if (proxyOnly) {
                 readUidTrafficCounters(uid)
             } else {
