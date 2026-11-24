@@ -138,10 +138,17 @@ jobs:
         run: bash android/tools/build_native_libs.sh
 
       - name: Build libopenconnect (OpenConnect engine)
-        if: steps.native-cache.outputs.cache-hit != 'true'
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
-        run: bash android/native/build-openconnect.sh
+        run: |
+          # Runs even when the native cache hit: a cache saved before this engine existed has no libopenconnect.so.
+          if [ -s android/app/src/main/jniLibs/arm64-v8a/libopenconnect.so ] \
+            && [ -s android/app/src/main/jniLibs/armeabi-v7a/libopenconnect.so ] \
+            && [ -s android/app/src/main/jniLibs/x86_64/libopenconnect.so ]; then
+            echo "libopenconnect.so is already in place for every ABI."
+          else
+            bash android/native/build-openconnect.sh
+          fi
 
       - name: Check libopenconnect.so is in every ABI
         run: |
