@@ -1,0 +1,15 @@
+2001:dec::,2001:dec:0:ffff:ffff:ffff:ffff:ffff,VU
+2001:df0:410::,2001:df0:410:ffff:ffff:ffff:ffff:ffff,VU
+2001:df2:a700::,2001:df2:a700:ffff:ffff:ffff:ffff:ffff,VU
+2400:3100::,2400:3100:3fff:ffff:ffff:ffff:ffff:ffff,VU
+2400:3100:4100::,2400:3100:ffff:ffff:ffff:ffff:ffff:ffff,VU
+2400:3400::,2400:3400:ffff:ffff:ffff:ffff:ffff:ffff,VU
+2400:c0c0::,2400:c0c0:ffff:ffff:ffff:ffff:ffff:ffff,VU
+2401:7a40::,2401:7a40:ffff:ffff:ffff:ffff:ffff:ffff,VU
+2403:fbc0:1::,2403:fbc0:fff:ffff:ffff:ffff:ffff:ffff,VU
+2403:fbc0:1001::,2403:fbc0:1fff:ffff:ffff:ffff:ffff:ffff,VU
+2403:fbc0:2001::,2403:fbc0:2fff:ffff:ffff:ffff:ffff:ffff,VU
+2403:fbc0:3001::,2403:fbc0:3fff:ffff:ffff:ffff:ffff:ffff,VU
+2403:fbc0:4001::,2403:fbc0:ffff:ffff:ffff:ffff:ffff:ffff,VU
+2a09:4c0:f700::,2a09:4c0:f7ff:ffff:ffff:ffff:ffff:ffff,VU
+2a0e:97c0:4bf3::,2a0e:97c0:4bf3:ffff:ffff:ffff:ffff:ffff,VU

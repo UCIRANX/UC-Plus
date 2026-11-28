@@ -1,0 +1,17 @@
+2800:a20::,2800:a20:7fff:ffff:ffff:ffff:ffff:ffff,AW
+2800:ad0::,2800:ad0:ffff:ffff:ffff:ffff:ffff:ffff,AW
+2801:19:5800::,2801:19:5800:ffff:ffff:ffff:ffff:ffff,AW
+2803:b640::,2803:b640:ffff:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff00::,2a05:1083:ff0d:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff0f::,2a05:1083:ff3a:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff3c::,2a05:1083:ff49:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff4c::,2a05:1083:ff51:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff53::,2a05:1083:ff63:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ff65::,2a05:1083:ffa4:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ffa6::,2a05:1083:ffaf:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ffb2::,2a05:1083:ffd4:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ffd6::,2a05:1083:ffe1:ffff:ffff:ffff:ffff:ffff,AW
+2a05:1083:ffe3::,2a05:1083:ffff:ffff:ffff:ffff:ffff:ffff,AW
+2a09:4c0:1c00::,2a09:4c0:1cff:ffff:ffff:ffff:ffff:ffff,AW
+2a0e:97c0:4b0e::,2a0e:97c0:4b0e:ffff:ffff:ffff:ffff:ffff,AW
+2a11:4c0:6::,2a11:4c0:6:ffff:ffff:ffff:ffff:ffff,AW
